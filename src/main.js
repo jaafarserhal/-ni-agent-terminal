@@ -518,6 +518,8 @@ function trackSessions() {
 }
 setInterval(trackSessions, TRACK_MS);
 
+const TAIL_CHARS = 2 * 1024 * 1024;
+
 // `prompt`: a first message for the agent, sent as a launch argument (a handoff).
 async function startPty({ tabId, agent, cwd, recordId, mode, accountId, cols, rows, prompt }) {
   if (!AGENTS[agent]) throw new Error(`Unknown agent ${agent}`);
@@ -609,6 +611,9 @@ async function startPty({ tabId, agent, cwd, recordId, mode, accountId, cols, ro
     status: null, // Claude's own 'busy' / 'idle'
     buf: '',
     flushTimer: null,
+    tail: [], // the latest output, to redraw the tab after the window reloads
+    tailLength: 0,
+    detached: false, // the window is reloading: output only goes to the tail
   };
   let markExited;
   s.exited = new Promise((resolve) => { markExited = resolve; });
@@ -620,6 +625,10 @@ async function startPty({ tabId, agent, cwd, recordId, mode, accountId, cols, ro
     if (SMOKE_SHOT) console.log(`[${process.uptime().toFixed(2)}s pty ${tabId}] +${Date.now() - s.since}ms ${data.length}b`);
     // s.recordId, not rec: the tab may have moved on to another conversation.
     history.append(s.recordId, data);
+    s.tail.push(data);
+    s.tailLength += data.length;
+    while (s.tailLength - s.tail[0].length > TAIL_CHARS) s.tailLength -= s.tail.shift().length;
+    if (s.detached) return;
     // Coalesce chunks so a busy TUI redraw is one IPC message, not hundreds.
     s.buf += data;
     if (!s.flushTimer) {
@@ -726,15 +735,15 @@ function handle(channel, fn) {
 
 handle('app:init', async () => {
   const state = readJson(stateFile, { tabs: [] });
-  const restore = settings.restoreTabs
-    ? (state.tabs || [])
-        .map((t) => ({
-          ...t,
-          record: t.recordId ? publicRecord(history.get(t.recordId)) : null,
-          chain: (Array.isArray(t.chain) ? t.chain : []).filter((id) => history.get(id)),
-        }))
-        .filter((t) => AGENTS[t.agent] && (t.record || !t.recordId))
-    : [];
+  // `live`: its agent is still running here (the window was reloaded), so the tab attaches to it.
+  const restore = (state.tabs || [])
+    .map((t) => ({
+      ...t,
+      live: sessions.has(t.tabId),
+      record: t.recordId ? publicRecord(history.get(t.recordId)) : null,
+      chain: (Array.isArray(t.chain) ? t.chain : []).filter((id) => history.get(id)),
+    }))
+    .filter((t) => (settings.restoreTabs || t.live) && AGENTS[t.agent] && (t.record || !t.recordId));
   return {
     version: app.getVersion(),
     settings: publicSettings(),
@@ -761,6 +770,23 @@ handle('clipboard:imagePath', (tabId) => {
   return dropText(tabId, [file]);
 });
 handle('pty:kill', (tabId) => { stopPty(tabId); });
+
+// Reloading the window (new renderer code) keeps every agent running: their processes belong
+// to this process. Output is held back until the reloaded tab attaches and takes the tail,
+// so nothing is lost or drawn twice.
+handle('app:reload', () => {
+  for (const s of sessions.values()) s.detached = true;
+  win.webContents.reload();
+});
+handle('pty:attach', (tabId) => {
+  const s = sessions.get(tabId);
+  if (!s) return null;
+  s.detached = false;
+  clearTimeout(s.flushTimer);
+  s.flushTimer = null;
+  s.buf = '';
+  return { data: s.tail.join(''), status: s.status, record: publicRecord(history.get(s.recordId)) };
+});
 handle('pty:switchAccount', (opts) => switchAccount(opts || {}));
 ipcMain.on('pty:write', (_e, { tabId, data }) => {
   const s = sessions.get(tabId);

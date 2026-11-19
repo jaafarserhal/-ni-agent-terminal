@@ -247,8 +247,10 @@ function activeTab() {
 }
 
 // prompt: a first message the agent is launched with (a handoff), sent on the first start only.
-function createTab({ agent, cwd, record, mode, chain, accountId, prompt, activate = true }) {
-  const id = `t${state.nextTabId++}`;
+// live: the tab's id from before a window reload, whose agent is still running.
+function createTab({ agent, cwd, record, mode, chain, accountId, prompt, live, activate = true }) {
+  const id = live || `t${state.nextTabId++}`;
+  if (live) state.nextTabId = Math.max(state.nextTabId, Number(live.slice(1)) + 1);
   const host = el('div', { class: 'term-host hidden-tab' });
   $('#terminals').append(host);
 
@@ -339,10 +341,39 @@ function createTab({ agent, cwd, record, mode, chain, accountId, prompt, activat
     term.focus();
   });
 
+  if (live) attachTab(tab);
   renderTabs();
   if (activate) activateTab(id);
   saveState();
   return tab;
+}
+
+// Takes over the running agent of a tab from before a window reload: redraws its latest
+// output, after which new output arrives as usual.
+async function attachTab(tab) {
+  tab.started = true;
+  tab.running = true;
+  const res = await ipc.attach(tab.id);
+  if (!res) {
+    // It exited during the reload: the tab resumes its conversation when shown.
+    tab.started = false;
+    tab.running = false;
+    if (tab.id === state.activeId) startTab(tab);
+    return;
+  }
+  tab.record = res.record;
+  tab.status = res.status;
+  // The transcript saved before the reload stays; what follows is appended to it.
+  tab.reattached = true;
+  tab.term.write(res.data, () => setSnapMarker(tab, tab.term.registerMarker(0)));
+  ipc.resize(tab.id, tab.term.cols, tab.term.rows);
+  renderTabs();
+  renderStatus();
+}
+
+async function reloadWindow() {
+  await Promise.all([...state.tabs.map((t) => snapshot(t, true)), saveStateNow()]);
+  await ipc.reload();
 }
 
 async function startTab(tab) {
@@ -636,7 +667,8 @@ function snapshot(tab, force) {
   // Most of the scrollback is gone: the screen was cleared. Keep the transcript saved so
   // far and append from here instead of overwriting it with the shorter screen.
   const last = tab.lastSnap;
-  const cleared = !!last && last.recordId === tab.record.id && last.from === from && last.lines > 40 && lines.length < last.lines / 2;
+  const cleared = tab.reattached || (!!last && last.recordId === tab.record.id && last.from === from && last.lines > 40 && lines.length < last.lines / 2);
+  tab.reattached = false;
   tab.lastSnap = { recordId: tab.record.id, from, lines: lines.length };
   return ipc.historySnapshot(tab.record.id, lines.join('\n') + '\n', cleared).catch(() => {});
 }
@@ -1952,6 +1984,13 @@ function openSettings() {
 }
 $('#btn-settings').onclick = openSettings;
 
+// After changing the app's window code: the window restarts on it without stopping anything.
+$('#brand').onclick = () =>
+  openModal('Reload the window?', [
+    el('p', {}, 'The window restarts on its current code. Tabs stay open and their agents keep running, with their background shells and subagents.'),
+    el('p', { class: 'help' }, 'Code of the background process (launching, tracking, settings) only loads when the app is quit and started again.'),
+  ], [{ label: 'Cancel' }, { label: 'Reload', primary: true, run: reloadWindow }]);
+
 // ---------------------------------------------------------------------------
 // setup: workspace folders and agents (first start, or Settings → Change…)
 // ---------------------------------------------------------------------------
@@ -2281,7 +2320,7 @@ function saveStateNow() {
   clearTimeout(saveTimer);
   // Tabs that were never activated have no record yet; keep them as agent + folder.
   const tabs = state.tabs.map((t) =>
-    t.record ? { recordId: t.record.id, agent: t.agent, chain: t.chain } : { agent: t.agent, cwd: t.cwd, mode: t.mode, accountId: t.accountId }
+    t.record ? { tabId: t.id, recordId: t.record.id, agent: t.agent, chain: t.chain } : { agent: t.agent, cwd: t.cwd, mode: t.mode, accountId: t.accountId }
   );
   const activeIndex = Math.max(0, state.tabs.findIndex((t) => t.id === state.activeId));
   return ipc.saveState({ tabs, activeIndex }).catch(() => {});
@@ -2401,6 +2440,7 @@ async function boot() {
         chain: t.chain,
         mode: t.record ? 'resume' : t.mode || 'new',
         accountId: t.record ? null : t.accountId,
+        live: t.live && t.tabId,
         activate: false,
       })
     );

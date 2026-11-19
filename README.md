@@ -110,6 +110,8 @@ npm test                # src/py tests (Python 3)
 npm run dist            # portable + installer exe into dist\
 ```
 
+After changing window code (`renderer.js`, `index.html`, `styles.css`), click the app icon in the top-left corner: the window reloads on it while tabs stay open and their agents keep running. Code of the main process loads when the app is restarted.
+
 Smoke testing: `NI_TERM_USERDATA` uses an isolated data folder. `NI_TERM_SMOKE=<png>` takes a screenshot and quits after `NI_TERM_SMOKE_DELAY` ms. `NI_TERM_SMOKE_JS` runs a script in the window halfway through.
 
 Build note: without Windows Developer Mode, electron-builder fails to unpack `winCodeSign` (macOS symlinks). Extract it once without the `darwin` folder:

@@ -50,7 +50,7 @@ kbd {
   padding-left: 8px;
 }
 #titlebar button, #tabs, .tab { -webkit-app-region: no-drag; }
-.brand { display: flex; align-items: center; padding-right: 6px; }
+.brand { display: flex; align-items: center; padding-right: 6px; cursor: pointer; -webkit-app-region: no-drag; }
 .brand img { width: 20px; height: 20px; }
 .drag-spacer { flex: 1; min-width: 40px; }
 .overlay-gap { width: var(--overlay-w); flex: none; }
