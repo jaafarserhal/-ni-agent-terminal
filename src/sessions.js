@@ -2,20 +2,22 @@
 // Native session discovery and titles.
 //
 // Each agent can switch conversations while it runs (/clear, /new, /resume), so the
-// app keeps asking the agent's own store which conversation a tab is on. `dir`, where
-// given, is the agent's config folder (CLAUDE_CONFIG_DIR / CODEX_HOME) for that tab:
+// app keeps asking the agent's own store which conversation a tab is on. `dir` is that
+// store as Windows reaches it (under \\wsl$\<distro> for a WSL tab): the agent's config
+// folder (CLAUDE_CONFIG_DIR / CODEX_HOME) or Cursor's chats folder. `cwd` is the folder
+// as the agent sees it (/mnt/c/... in WSL), which is what its store records:
 //   claude  ~/.claude/sessions/<pid>.json names the live process's current session
 //           exactly; the project folder's *.jsonl files are the fallback.
 //   codex   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl, whose first line holds id + cwd.
 //   cursor  ~/.cursor/chats/<ws>/<chatId>/meta.json, which holds cwd + createdAtMs.
+// OpenCode keeps one SQLite database, read through Python (see engine.js).
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
-const HOME = os.homedir();
-
-const normPath = (p) => path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
+// A POSIX path (an agent's own path in WSL) is kept as is: resolving it would make it C:\...
+const absPath = (p) => (p.startsWith('/') ? p : path.resolve(p));
+const normPath = (p) => absPath(p).replace(/[\\/]+$/, '').toLowerCase();
 const samePath = (a, b) => !!a && !!b && normPath(a) === normPath(b);
 
 function safeStat(p) {
@@ -87,23 +89,19 @@ function readFirstLine(file, max = 4 * 1024 * 1024) {
   }
 }
 
-const claudeBase = (dir) => dir || process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
-const codexBase = (dir) => dir || process.env.CODEX_HOME || path.join(HOME, '.codex');
-const cursorBase = () => process.env.CURSOR_CHATS_DIR || path.join(HOME, '.cursor', 'chats');
-
 // ---------------------------------------------------------------------------
 // Claude
 // ---------------------------------------------------------------------------
 
 function claudeProjectDir(cwd, dir) {
-  return path.join(claudeBase(dir), 'projects', path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, '-'));
+  return path.join(dir, 'projects', absPath(cwd).replace(/[^a-zA-Z0-9]/g, '-'));
 }
 
 function claudeSessionFile(cwd, id, dir) {
   const own = path.join(claudeProjectDir(cwd, dir), `${id}.jsonl`);
   if (safeStat(own)) return own;
   // The session may have been started from another folder.
-  const base = path.join(claudeBase(dir), 'projects');
+  const base = path.join(dir, 'projects');
   for (const d of safeReaddir(base)) {
     const f = path.join(base, d.name, `${id}.jsonl`);
     if (d.isDirectory() && safeStat(f)) return f;
@@ -115,23 +113,45 @@ function claudeSessionExists(cwd, id, dir) {
   return !!id && !!claudeSessionFile(cwd, id, dir);
 }
 
-// The session a running Claude process is on right now, read from its pid file.
-// Claude rewrites the file on /clear and /resume, so it follows the conversation exactly.
-function claudeLiveSession(pid, cwd, since, dir) {
+// A running Claude process's pid file: { sessionId, status ('busy' | 'idle'), name, ... }.
+// Claude rewrites it on /clear and /resume, so it follows the conversation exactly.
+// `since` (0: no check) skips a file left behind by an earlier process with the same pid.
+function claudeLive(pid, cwd, since, dir) {
   if (!pid) return null;
-  const file = path.join(claudeBase(dir), 'sessions', `${pid}.json`);
+  const file = path.join(dir, 'sessions', `${pid}.json`);
   const st = safeStat(file);
-  // Ignore a file left behind by an earlier process that had the same pid.
   if (!st || st.mtimeMs < since - 10000) return null;
   try {
     const j = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (j.pid !== undefined && Number(j.pid) !== Number(pid)) return null;
     if (j.cwd && cwd && !samePath(j.cwd, cwd)) return null;
     if (j.startedAt && j.startedAt < since - 10000) return null;
-    return typeof j.sessionId === 'string' ? j.sessionId : null;
+    return typeof j.sessionId === 'string' ? j : null;
   } catch (_) {
     return null; // being rewritten
   }
+}
+
+// The Claude pid files present now, so a tab can tell which one its own Claude adds.
+function claudePids(dir) {
+  return new Set(safeReaddir(path.join(dir, 'sessions')).filter((e) => /^\d+\.json$/.test(e.name)).map((e) => Number(e.name.slice(0, -5))));
+}
+
+// The pid of the Claude process a tab started, when the tab's own pid is not Claude's (a
+// WSL tab runs wsl.exe): the pid file in its folder on the session it was launched with,
+// else the earliest other one, among those that appeared after it started (not in `before`:
+// a restarted tab's previous process may still have its file) that no other tab owns.
+// Clock-free: WSL's clock can drift from Windows' after sleep.
+function claudeFindPid(cwd, dir, nativeId, taken, before) {
+  let fresh = null;
+  for (const pid of claudePids(dir)) {
+    if (taken.has(pid) || before.has(pid)) continue;
+    const j = claudeLive(pid, cwd, 0, dir);
+    if (!j) continue;
+    if (nativeId && j.sessionId === nativeId) return pid;
+    if (!fresh || j.startedAt < fresh.startedAt) fresh = { pid, startedAt: j.startedAt || 0 };
+  }
+  return fresh && fresh.pid;
 }
 
 function claudeSessions(cwd, since, configDir) {
@@ -179,7 +199,7 @@ function claudeTitle(cwd, nativeId, dir) {
 // ---------------------------------------------------------------------------
 
 function codexDayDirs(since, configDir) {
-  const base = path.join(codexBase(configDir), 'sessions');
+  const base = path.join(configDir, 'sessions');
   const dirs = new Set();
   const now = Date.now();
   for (let t = Math.max(since - 86400000, now - 40 * 86400000); ; t += 86400000) {
@@ -215,6 +235,13 @@ function codexMeta(file, name) {
   return meta;
 }
 
+// When a rollout was created, from its name (rollout-2026-11-16T15-15-35-<id>.jsonl, local
+// time): over \\wsl$ a file's birth time is only its last write.
+function rolloutBirth(name) {
+  const m = /^rollout-(\d{4})-(\d\d)-(\d\d)T(\d\d)-(\d\d)-(\d\d)/.exec(name);
+  return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() : null;
+}
+
 function codexSessions(cwd, since, configDir) {
   const out = [];
   for (const dir of codexDayDirs(since, configDir)) {
@@ -225,7 +252,7 @@ function codexSessions(cwd, since, configDir) {
       if (!st || st.mtimeMs < since) continue;
       const meta = codexMeta(file, e.name);
       if (!meta || !meta.id || !samePath(meta.cwd, cwd)) continue;
-      out.push({ id: meta.id, birth: st.birthtimeMs || st.ctimeMs, t: st.mtimeMs });
+      out.push({ id: meta.id, birth: rolloutBirth(e.name) || st.birthtimeMs || st.ctimeMs, t: st.mtimeMs });
     }
   }
   return out;
@@ -233,7 +260,7 @@ function codexSessions(cwd, since, configDir) {
 
 const codexIndexes = new Map(); // session_index.jsonl path -> { mtime, names }
 function codexTitle(nativeId, dir) {
-  const file = path.join(codexBase(dir), 'session_index.jsonl');
+  const file = path.join(dir, 'session_index.jsonl');
   const st = safeStat(file);
   if (!st) return null;
   let codexIndex = codexIndexes.get(file) || { mtime: -1, names: new Map() };
@@ -257,11 +284,11 @@ function codexTitle(nativeId, dir) {
 // Cursor
 // ---------------------------------------------------------------------------
 
-function cursorSessions(cwd, since) {
+function cursorSessions(cwd, since, dir) {
   const out = [];
-  for (const ws of safeReaddir(cursorBase())) {
+  for (const ws of safeReaddir(dir)) {
     if (!ws.isDirectory()) continue;
-    const wsDir = path.join(cursorBase(), ws.name);
+    const wsDir = path.join(dir, ws.name);
     for (const chat of safeReaddir(wsDir)) {
       if (!chat.isDirectory()) continue;
       const chatDir = path.join(wsDir, chat.name);
@@ -283,9 +310,9 @@ function cursorSessions(cwd, since) {
   return out;
 }
 
-function cursorTitle(nativeId) {
-  for (const ws of safeReaddir(cursorBase())) {
-    const meta = path.join(cursorBase(), ws.name, nativeId, 'meta.json');
+function cursorTitle(nativeId, dir) {
+  for (const ws of safeReaddir(dir)) {
+    const meta = path.join(dir, ws.name, nativeId, 'meta.json');
     if (safeStat(meta)) {
       try {
         return JSON.parse(fs.readFileSync(meta, 'utf8')).title || null;
@@ -303,7 +330,7 @@ function cursorTitle(nativeId) {
 
 // The rollout file of a Codex conversation, newest day folders first.
 function codexSessionFile(id, dir) {
-  const base = path.join(codexBase(dir), 'sessions');
+  const base = path.join(dir, 'sessions');
   const names = (p) => safeReaddir(p).filter((e) => e.isDirectory()).map((e) => e.name).sort().reverse();
   for (const y of names(base)) {
     for (const m of names(path.join(base, y))) {
@@ -329,32 +356,29 @@ function copyNewer(src, fromBase, toBase) {
   return true;
 }
 
-// Copies a conversation from one account's store (config folder, null for the
-// default) to another's, so the other account can resume it. Returns whether the
-// conversation was found. Cursor keeps one store for every account: nothing to copy.
+// Copies a conversation from one account's store to another's, so the other account can
+// resume it. Returns whether the conversation was found. Accounts linked to one shared
+// history (claude-accounts.sh) find the copy already there, so nothing is copied. Cursor
+// and OpenCode keep one store for every account: nothing to copy.
 function copyConversation(agentId, cwd, nativeId, fromDir, toDir) {
   if (!nativeId) return false;
   if (agentId === 'claude') {
     const file = claudeSessionFile(cwd, nativeId, fromDir);
     if (!file) return false;
-    const fromBase = claudeBase(fromDir);
-    const toBase = claudeBase(toDir);
-    if (samePath(fromBase, toBase)) return true;
-    copyNewer(file, fromBase, toBase);
+    if (samePath(fromDir, toDir)) return true;
+    copyNewer(file, fromDir, toDir);
     // Subagent transcripts and large tool results live next to it in <id>/.
     const side = file.slice(0, -'.jsonl'.length);
-    if (safeStat(side)) copyNewer(side, fromBase, toBase);
+    if (safeStat(side)) copyNewer(side, fromDir, toDir);
     return true;
   }
   if (agentId === 'codex') {
     const file = codexSessionFile(nativeId, fromDir);
     if (!file) return false;
-    const fromBase = codexBase(fromDir);
-    const toBase = codexBase(toDir);
-    if (!samePath(fromBase, toBase)) copyNewer(file, fromBase, toBase);
+    if (!samePath(fromDir, toDir)) copyNewer(file, fromDir, toDir);
     return true;
   }
-  return agentId === 'cursor';
+  return agentId === 'cursor' || agentId === 'opencode';
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +389,7 @@ function listSessions(agentId, cwd, since, dir) {
   let out = [];
   if (agentId === 'claude') out = claudeSessions(cwd, since, dir);
   else if (agentId === 'codex') out = codexSessions(cwd, since, dir);
-  else if (agentId === 'cursor') out = cursorSessions(cwd, since);
+  else if (agentId === 'cursor') out = cursorSessions(cwd, since, dir);
   return out.sort((a, b) => b.t - a.t);
 }
 
@@ -374,13 +398,15 @@ function nativeTitle(agentId, cwd, nativeId, dir) {
   if (!nativeId) return null;
   if (agentId === 'claude') return claudeTitle(cwd, nativeId, dir);
   if (agentId === 'codex') return codexTitle(nativeId, dir);
-  if (agentId === 'cursor') return cursorTitle(nativeId);
+  if (agentId === 'cursor') return cursorTitle(nativeId, dir);
   return null;
 }
 
 module.exports = {
   listSessions,
-  claudeLiveSession,
+  claudeLive,
+  claudePids,
+  claudeFindPid,
   claudeSessionExists,
   copyConversation,
   nativeTitle,

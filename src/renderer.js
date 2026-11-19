@@ -16,8 +16,11 @@ const THEME = {
   brightBlue: '#82b5ff', brightMagenta: '#d7b8ff', brightCyan: '#7fdbe8', brightWhite: '#ffffff',
 };
 
-const AGENT_KEYS = ['claude', 'codex', 'cursor', 'shell'];
-const BADGE = { claude: 'C', codex: 'X', cursor: 'Cu', shell: '>' };
+// Menu order; Ctrl+Shift+1…5 follow it.
+const AGENT_KEYS = ['claude', 'codex', 'cursor', 'shell', 'opencode'];
+const BADGE = { claude: 'C', codex: 'X', cursor: 'Cu', opencode: 'O', shell: '>' };
+// Agents whose conversations the engine (src/py) lists and hands off.
+const ENGINE_AGENTS = ['claude', 'codex', 'opencode'];
 
 const state = {
   settings: null,
@@ -29,6 +32,8 @@ const state = {
   historyAgent: 'all',
   historyQuery: '',
   historyFolder: null, // folder picked in the Folder view; null follows the active tab
+  agentsHidden: false, // the Agents view lists hidden conversations instead
+  agentsMarked: new Set(), // Agents view rows marked (Ctrl+click) to combine
   viewer: null,
   nextTabId: 1,
 };
@@ -141,8 +146,96 @@ function showContextMenu(x, y, items) {
   ctx.style.top = Math.min(y, window.innerHeight - r.height - 8) + 'px';
 }
 
-function quotePath(p) {
-  return /[\s&()^'"]/.test(p) ? `"${p}"` : p;
+// ---------------------------------------------------------------------------
+// link colors
+// ---------------------------------------------------------------------------
+// Web links are drawn in the theme's blue wherever they appear, whatever program printed
+// them; WebLinksAddon only underlines one under the mouse. After each render the visible
+// rows are scanned (a wrapped line as one) and each link gets a decoration that recolors
+// its cells. Decorations follow their lines into the scrollback; ones whose cells no longer
+// hold that link (a TUI redrew the screen) are dropped.
+
+// WebLinksAddon's own pattern, so a colored link is exactly a clickable one.
+const URL_RE = /(https?|HTTPS?):[/]{2}[^\s"'!*(){}|\\^<>`]*[^\s"':,.!?{}|\\^~[\]`()<>]/;
+const LINK_COLOR = THEME.blue;
+
+// A clicked web link, in the default browser.
+function openLink(uri) {
+  ipc.openExternal(uri).catch((err) => toast(err.message));
+}
+
+function colorLinks(term) {
+  const decorated = new Set(); // { d: decoration, x, width }
+  let timer = null;
+
+  // The visible rows' text, grouped into logical lines, with the cell of each character.
+  function logicalLines(buf, first, last) {
+    const out = [];
+    const cell = buf.getNullCell();
+    let start = first;
+    while (start > 0 && buf.getLine(start) && buf.getLine(start).isWrapped) start--;
+    let cur = null;
+    for (let y = start; y <= last; y++) {
+      const line = buf.getLine(y);
+      if (!line) break;
+      if (!line.isWrapped || !cur) {
+        cur = { text: '', cells: [] };
+        out.push(cur);
+      }
+      for (let x = 0; x < line.length; x++) {
+        line.getCell(x, cell);
+        if (!cell.getWidth()) continue;
+        const ch = cell.getChars() || ' ';
+        cur.text += ch;
+        for (let i = 0; i < ch.length; i++) cur.cells.push({ y, x, w: cell.getWidth() });
+      }
+    }
+    return out;
+  }
+
+  function scan() {
+    timer = null;
+    const buf = term.buffer.active;
+    const first = buf.viewportY;
+    const last = first + term.rows - 1;
+    const want = new Map(); // "line:col" -> { y, x, width }: one per row a link spans
+    for (const { text, cells } of logicalLines(buf, first, last)) {
+      for (const m of text.matchAll(new RegExp(URL_RE.source, 'g'))) {
+        let seg = null;
+        for (const c of cells.slice(m.index, m.index + m[0].length)) {
+          if (seg && seg.y === c.y) seg.width = c.x + c.w - seg.x;
+          else want.set(`${c.y}:${c.x}`, (seg = { y: c.y, x: c.x, width: c.w }));
+        }
+      }
+    }
+    // What is already drawn stays; a visible one whose cells no longer hold its link goes.
+    for (const e of decorated) {
+      const y = e.d.marker.line; // -1 once trimmed off the scrollback
+      const seg = want.get(`${y}:${e.x}`);
+      if (seg && seg.width === e.width) want.delete(`${y}:${e.x}`);
+      else if (y < 0 || (y >= first && y <= last)) {
+        e.d.dispose();
+        decorated.delete(e);
+      }
+    }
+    const base = buf.baseY + buf.cursorY;
+    for (const seg of want.values()) {
+      const marker = term.registerMarker(seg.y - base);
+      const d = marker && term.registerDecoration({ marker, x: seg.x, width: seg.width, foregroundColor: LINK_COLOR });
+      if (!d) continue;
+      d.onDispose(() => marker.dispose());
+      decorated.add({ d, x: seg.x, width: seg.width });
+    }
+  }
+
+  // Links only change when output is written, the view scrolls or lines rewrap. Coalesced:
+  // a busy agent writes many times a second.
+  const soon = () => {
+    if (!timer) timer = setTimeout(scan, 120);
+  };
+  term.onWriteParsed(soon);
+  term.onScroll(soon);
+  term.onResize(soon);
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +246,8 @@ function activeTab() {
   return state.tabs.find((t) => t.id === state.activeId) || null;
 }
 
-function createTab({ agent, cwd, record, mode, chain, accountId, activate = true }) {
+// prompt: a first message the agent is launched with (a handoff), sent on the first start only.
+function createTab({ agent, cwd, record, mode, chain, accountId, prompt, activate = true }) {
   const id = `t${state.nextTabId++}`;
   const host = el('div', { class: 'term-host hidden-tab' });
   $('#terminals').append(host);
@@ -167,19 +261,25 @@ function createTab({ agent, cwd, record, mode, chain, accountId, activate = true
     allowProposedApi: true,
     macOptionIsMeta: true,
     windowsPty: { backend: 'conpty' },
+    // Hyperlinks a program prints (OSC 8; Claude prints its links this way). xterm's own
+    // handler asks "could potentially be dangerous" and then opens a blank window.
+    linkHandler: { activate: (_e, uri) => openLink(uri) },
   });
   const fit = new FitAddon.FitAddon();
   const search = new SearchAddon.SearchAddon();
   term.loadAddon(fit);
   term.loadAddon(search);
-  term.loadAddon(new WebLinksAddon.WebLinksAddon((_e, uri) => window.open(uri)));
+  term.loadAddon(new WebLinksAddon.WebLinksAddon((_e, uri) => openLink(uri), { urlRegex: URL_RE }));
   term.open(host);
+  colorLinks(term);
 
   const tab = {
     id, agent, cwd, mode: mode || (record ? 'resume' : 'new'),
     record: record || null, term, fit, search, host,
     // Account a new conversation starts under (null: the agent's current one).
     accountId: accountId || null,
+    prompt: prompt || null,
+    status: null, // Claude's 'busy' / 'idle'
     started: false, running: false, exitCode: null, dirty: false, lastSnapshot: 0,
     node: null, exitBar: null, input: newInput(),
     // Every conversation this tab has gone through (/clear, /new, /resume), oldest first.
@@ -203,6 +303,17 @@ function createTab({ agent, cwd, record, mode, chain, accountId, activate = true
   });
   term.onResize(({ cols, rows }) => tab.running && ipc.resize(tab.id, cols, rows));
   term.onTitleChange(() => renderTabs());
+  // An agent's own copy (Claude's /copy, a TUI selection) arrives as OSC 52, which xterm.js
+  // ignores: put it on the clipboard. Requests to read the clipboard ('?') are refused.
+  term.parser.registerOscHandler(52, (data) => {
+    const b64 = data.slice(data.indexOf(';') + 1);
+    if (b64 && b64 !== '?') {
+      try {
+        ipc.clipboardWrite(new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))));
+      } catch (_) { /* not base64 */ }
+    }
+    return true;
+  });
   term.attachCustomKeyEventHandler((e) => handleTermKey(tab, e));
 
   host.addEventListener('contextmenu', (e) => {
@@ -215,11 +326,16 @@ function createTab({ agent, cwd, record, mode, chain, accountId, activate = true
       pasteInto(tab, true);
     }
   });
+  // Once the selection is made, not on every change while dragging.
+  host.addEventListener('mouseup', () => {
+    if (state.settings.copyOnSelect && term.hasSelection()) ipc.clipboardWrite(term.getSelection());
+  });
   host.addEventListener('dragover', (e) => e.preventDefault());
   host.addEventListener('drop', (e) => {
     e.preventDefault();
     const paths = [...e.dataTransfer.files].map((f) => ipc.pathForFile(f)).filter(Boolean);
-    if (paths.length && tab.running) ipc.write(tab.id, paths.map(quotePath).join(' ') + ' ');
+    // Quoted for the tab's shell, as WSL paths in a WSL tab.
+    if (paths.length && tab.running) ipc.dropText(tab.id, paths).then((text) => text && ipc.write(tab.id, text));
     term.focus();
   });
 
@@ -251,9 +367,11 @@ async function startTab(tab) {
       recordId: tab.record && tab.record.id,
       mode: tab.mode,
       accountId: tab.accountId,
+      prompt: tab.prompt,
       cols: tab.term.cols,
       rows: tab.term.rows,
     });
+    tab.prompt = null;
     tab.record = res.record;
     if (!tab.chain.includes(res.record.id)) tab.chain.push(res.record.id);
     tab.cwd = res.record.cwd;
@@ -332,7 +450,8 @@ function tabLabel(tab) {
   const where = rec ? rec.cwdLabel : labelForCwd(tab.cwd);
   const title = rec && (rec.customTitle || rec.title);
   const acct = multiAccount(tab.agent) ? tabAccount(tab) : null;
-  return { main: title || agentLabel(tab.agent), sub: acct ? `${where} · ${acct.name}` : where };
+  const wsl = rec && rec.backendLabel ? 'WSL' : null;
+  return { main: title || agentLabel(tab.agent), sub: [where, acct && acct.name, wsl].filter(Boolean).join(' · ') };
 }
 
 function labelForCwd(cwd) {
@@ -349,10 +468,10 @@ function renderTabs() {
     const node = el(
       'div',
       {
-        class: `tab${tab.id === state.activeId ? ' active' : ''}${tab.started && !tab.running ? ' exited' : ''}${tab.activity ? ' activity' : ''}`,
+        class: `tab${tab.id === state.activeId ? ' active' : ''}${tab.started && !tab.running ? ' exited' : ''}${tab.activity ? ' activity' : ''}${tab.running && ['busy', 'shell'].includes(tab.status) ? ' working' : ''}`,
         style: `--c:${agentColor(tab.agent)}`,
         role: 'tab',
-        title: `${agentLabel(tab.agent)}${multiAccount(tab.agent) ? ` (${tabAccount(tab).name})` : ''} · ${tab.cwd || ''}`,
+        title: `${agentLabel(tab.agent)}${multiAccount(tab.agent) ? ` (${tabAccount(tab).name})` : ''} · ${tab.cwd || ''}${tab.record && tab.record.backendLabel ? ` · ${tab.record.backendLabel}` : ''}${tab.status ? ` · ${tab.status}` : ''}`,
         draggable: 'true',
         onmousedown: (e) => {
           if (e.button === 0 && !e.target.closest('.close')) activateTab(tab.id);
@@ -629,8 +748,16 @@ function commitInput(tab) {
 async function pasteInto(tab, fromMouse) {
   const clip = await ipc.clipboardRead();
   if (clip.text) tab.term.paste(clip.text);
-  // With only an image on the clipboard, let the agent read it itself (Ctrl+V).
-  else if (clip.hasImage && !fromMouse && tab.running) ipc.write(tab.id, '\x16');
+  else if (clip.hasImage && tab.running) {
+    // With only an image on the clipboard, let the agent read it itself (Ctrl+V). In WSL only
+    // Claude can reach the Windows clipboard: the others get a saved PNG's path, which they attach.
+    const wsl = tab.record && tab.record.backend && tab.record.backend !== 'windows';
+    if (wsl && tab.agent !== 'claude') {
+      if (tab.agent !== 'shell') tab.term.paste(await ipc.clipboardImagePath(tab.id));
+    } else if (!fromMouse) {
+      ipc.write(tab.id, '\x16');
+    }
+  }
   tab.term.focus();
 }
 
@@ -654,8 +781,11 @@ function handleTermKey(tab, e) {
     pasteInto(tab, false);
     return false;
   }
-  // Multi-line prompts: agents read ESC+CR (Claude, Cursor) or LF (Codex) as a newline.
-  if (e.shiftKey && !e.ctrlKey && !e.altKey && e.key === 'Enter' && tab.running) {
+  // Multi-line prompts (Shift+Enter, Ctrl+Enter): agents read ESC+CR (Claude, Cursor) or LF
+  // (Codex) as a newline. preventDefault: otherwise the key's keypress still reaches xterm
+  // as a plain Enter, which submits. A shell keeps them as Enter, as other terminals do.
+  if ((e.shiftKey || e.ctrlKey) && !(e.shiftKey && e.ctrlKey) && !e.altKey && e.key === 'Enter' && tab.running && tab.agent !== 'shell') {
+    e.preventDefault();
     ipc.write(tab.id, tab.agent === 'codex' ? '\n' : '\x1b\r');
     insertInput(tab.input, '\n');
     return false;
@@ -682,9 +812,9 @@ function isAppShortcut(e) {
   const k = e.key.toLowerCase();
   if (ctrl && e.key === 'Tab') return true;
   if (ctrl && (e.key === 'PageUp' || e.key === 'PageDown')) return true;
-  if (ctrl && e.shiftKey && ['t', 'w', 'h', 'f', 'i', 'a', ',', '1', '2', '3', '4', '!', '@', '#', '$'].includes(k)) return true;
+  if (ctrl && e.shiftKey && ['t', 'w', 'h', 'f', 'i', 'a', ',', '1', '2', '3', '4', '5', '!', '@', '#', '$', '%'].includes(k)) return true;
   if (ctrl && !e.shiftKey && ['=', '+', '-', '0'].includes(e.key)) return true;
-  if (ctrl && e.shiftKey && /^Digit[1-4]$/.test(e.code)) return true;
+  if (ctrl && e.shiftKey && /^Digit[1-5]$/.test(e.code)) return true;
   return false;
 }
 
@@ -701,7 +831,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Tab') return cycleTab(e.shiftKey ? -1 : 1);
   if (e.key === 'PageUp') return cycleTab(-1);
   if (e.key === 'PageDown') return cycleTab(1);
-  if (e.shiftKey && /^Digit[1-4]$/.test(e.code)) {
+  if (e.shiftKey && /^Digit[1-5]$/.test(e.code)) {
     const agent = AGENT_KEYS[Number(e.code.slice(5)) - 1];
     if (!enabledAgents().includes(agent)) return toast(`${agentLabel(agent)} is switched off (Settings → Workspaces & agents)`);
     const cur = activeTab();
@@ -820,7 +950,7 @@ function openNewMenu(cwd) {
     const go = async (mode) => {
       closePopovers();
       const accountId = acctSelect ? acctSelect.value : null;
-      // The account picked here becomes the one Ctrl+Shift+1…4 use as well.
+      // The account picked here becomes the one Ctrl+Shift+1…5 use as well.
       if (accountId && accountId !== activeAccountOf(agent).id) {
         applySaved(await ipc.saveSettings({ agents: { [agent]: { activeAccount: accountId } } }));
       }
@@ -843,7 +973,7 @@ function openNewMenu(cwd) {
               'div',
               { class: 'alt' },
               el('button', { class: 'small-btn', title: 'Continue the most recent conversation in this folder', onclick: () => go('continue') }, 'Last'),
-              el('button', { class: 'small-btn', title: "Open the agent's own session picker", onclick: () => go('picker') }, 'Pick…')
+              agent !== 'opencode' ? el('button', { class: 'small-btn', title: "Open the agent's own session picker", onclick: () => go('picker') }, 'Pick…') : null
             )
           : null
       )
@@ -906,10 +1036,19 @@ async function renderHistory() {
   $('#history-filter').classList.toggle('hidden', scope === 'tab');
   $('#history-tabhead').classList.toggle('hidden', scope !== 'tab');
   $('#history-folder-row').classList.toggle('hidden', scope !== 'folder');
+  $('#history-agents-row').classList.toggle('hidden', scope !== 'agents');
+  $('#history-search').classList.toggle('hidden', scope === 'live');
   $('#history-search').placeholder =
     scope === 'tab' ? 'Search prompts in this tab' : scope === 'folder' ? 'Search sessions in this folder' : 'Search title, folder or id';
   if (scope === 'tab') return renderTabPrompts(token);
-  for (const b of document.querySelectorAll('#history-filter button')) b.classList.toggle('on', b.dataset.agent === state.historyAgent);
+  // The stores' views only know the engine's agents.
+  const storeScope = scope === 'agents' || scope === 'live';
+  for (const b of document.querySelectorAll('#history-filter button')) {
+    b.classList.toggle('on', b.dataset.agent === state.historyAgent);
+    b.classList.toggle('hidden', storeScope && b.dataset.agent !== 'all' && !ENGINE_AGENTS.includes(b.dataset.agent));
+  }
+  if (scope === 'agents') return renderAgents(token);
+  if (scope === 'live') return renderLive(token);
 
   const cwd = scope === 'folder' ? historyFolderCwd() : null;
   if (scope === 'folder') renderFolderRow(token, cwd);
@@ -1081,9 +1220,8 @@ async function renderTabPrompts(token) {
 function promptItem(tab, p) {
   const insert = (send) => {
     if (!tab.running) return toast('This tab is not running. Resume it first.');
-    tab.term.paste(p.text);
-    // Give the agent a moment to take the paste before Enter.
-    if (send) setTimeout(() => tab.running && sendEnter(tab), 60);
+    if (send) submitText(tab, p.text);
+    else tab.term.paste(p.text);
     tab.term.focus();
   };
   return el(
@@ -1104,6 +1242,13 @@ function promptItem(tab, p) {
       el('button', { title: 'Send again', onclick: () => insert(true) }, '⏎')
     )
   );
+}
+
+// Pastes text into a running tab and sends it.
+function submitText(tab, text) {
+  tab.term.paste(text);
+  // Give the agent a moment to take the paste before Enter.
+  setTimeout(() => tab.running && sendEnter(tab), 60);
 }
 
 function sendEnter(tab) {
@@ -1258,6 +1403,311 @@ $('#history-search').addEventListener('input', (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Agents view: the agents' own stores, through the engine (engine.js)
+// ---------------------------------------------------------------------------
+// One row per conversation across Claude, Codex and OpenCode: sessions joined by a
+// handoff are one row, under the agent used last.
+// Open resumes a row in its own agent; Continue in… hands it to another agent through the
+// handoff ledger; Ctrl+click marks rows to combine into one conversation.
+
+let agentsCache = { at: 0, hidden: false, rows: null, error: null };
+let agentsLoading = null;
+
+function agentRows(force) {
+  const fresh = agentsCache.rows && agentsCache.hidden === state.agentsHidden && Date.now() - agentsCache.at < 20000;
+  if (fresh && !force) return Promise.resolve(agentsCache);
+  if (!agentsLoading) {
+    const hidden = state.agentsHidden;
+    agentsLoading = ipc.storesList(hidden)
+      .then((rows) => ({ rows, error: null }), (err) => ({ rows: [], error: err.message }))
+      .then((r) => {
+        agentsCache = { at: Date.now(), hidden, ...r };
+        agentsLoading = null;
+        return agentsCache;
+      });
+  }
+  return agentsLoading;
+}
+
+function invalidateAgents() {
+  agentsCache.at = 0;
+}
+
+const agentTabOf = (r) => state.tabs.find((t) => t.agent === r.tool && t.record && t.record.nativeId === r.id);
+
+async function renderAgents(token) {
+  const list = $('#history-list');
+  if (!agentsCache.rows || agentsCache.hidden !== state.agentsHidden) list.replaceChildren(el('div', { class: 'h-empty' }, 'Reading the agents\' stores…'));
+  renderAgentsBar();
+  const { rows, error } = await agentRows(false);
+  if (token !== historyRender) return;
+  const q = state.historyQuery.trim().toLowerCase();
+  const shown = rows.filter((r) =>
+    (state.historyAgent === 'all' || r.tool === state.historyAgent) &&
+    (!q || [r.title, r.cwd, r.cwdLabel, r.id, r.tool].some((v) => v && v.toLowerCase().includes(q))));
+  list.replaceChildren();
+  if (error) return list.append(el('div', { class: 'h-empty' }, error));
+  if (!shown.length) {
+    return list.append(el('div', { class: 'h-empty' }, q ? 'No matching conversations.' : state.agentsHidden ? 'No hidden conversations.' : 'No conversations in the agents\' stores yet.'));
+  }
+  for (const r of shown) list.append(agentItem(r));
+}
+
+function renderAgentsBar() {
+  const n = state.agentsMarked.size;
+  const marked = $('#history-agents-marked');
+  marked.replaceChildren(
+    ...(n
+      ? [
+          el('span', {}, `${n} marked`),
+          el('button', { class: 'small-btn', title: 'Combine the marked conversations into one', onclick: (e) => combineMenu(e.clientX, e.clientY) }, 'Combine into…'),
+          el('button', { class: 'small-btn', onclick: () => { state.agentsMarked.clear(); renderHistory(); } }, 'Clear'),
+        ]
+      : [el('span', { class: 'help' }, 'Ctrl+click marks rows to combine')])
+  );
+  $('#history-agents-hidden').classList.toggle('on', state.agentsHidden);
+}
+
+function agentItem(r) {
+  const open = agentTabOf(r);
+  const meta = [
+    relTime(r.updated * 1000),
+    agentLabel(r.tool),
+    r.cwdLabel,
+    r.via.length ? `via ${r.via.map(agentLabel).join(', ')}` : null,
+    r.accounts.length ? r.accounts.join(' › ') : null,
+    `…${r.id.slice(-6)}`,
+  ].filter(Boolean);
+  return el(
+    'div',
+    {
+      class: `h-item${open ? ' open' : ''}${state.agentsMarked.has(r.key) ? ' marked' : ''}`,
+      style: `--c:${agentColor(r.tool)}`,
+      title: `${r.cwd}\nSession ${r.id}\nClick to preview · double-click to open · Ctrl+click to mark for combining`,
+      onclick: (e) => {
+        if (e.target.closest('.acts')) return;
+        if (e.ctrlKey) return toggleMark(r);
+        if (open) activateTab(open.id);
+        else openAgentPreview(r);
+      },
+      ondblclick: (e) => !e.ctrlKey && openRow(r),
+      oncontextmenu: (e) => {
+        e.preventDefault();
+        agentMenu(r, e.clientX, e.clientY);
+      },
+    },
+    el('span', { class: 'dot' }),
+    el('span', { class: 't' }, r.title),
+    el(
+      'span',
+      { class: 'acts' },
+      open ? el('span', { class: 'open-pill' }, 'open') : el('button', { title: `Open in ${agentLabel(r.tool)}`, onclick: () => openRow(r) }, '▶'),
+      el('button', { title: 'Open with… / Continue in…', onclick: (e) => agentMenu(r, e.clientX, e.clientY) }, '⋯')
+    ),
+    el('span', { class: 'm' }, meta.join(' · '))
+  );
+}
+
+function toggleMark(r) {
+  if (!state.agentsMarked.delete(r.key)) state.agentsMarked.add(r.key);
+  renderHistory();
+}
+
+// Destinations: the row's own agent, then the others;
+// Claude once per account when there are several.
+function agentTargets(ownTool) {
+  const tools = [ownTool, ...ENGINE_AGENTS.filter((t) => t !== ownTool && enabledAgents().includes(t))].filter(Boolean);
+  return tools.flatMap((tool) =>
+    tool === 'claude' && multiAccount('claude')
+      ? [activeAccountOf('claude'), ...accountsOf('claude').filter((a) => a.id !== activeAccountOf('claude').id)].map((a) => ({ tool, accountId: a.id, label: `Claude · ${a.name}` }))
+      : [{ tool, accountId: null, label: agentLabel(tool) }]);
+}
+
+function agentMenu(r, x, y) {
+  const targets = agentTargets(r.tool);
+  showContextMenu(x, y, [
+    ...targets.filter((t) => t.tool === r.tool).map((t, i) => ({
+      label: `Open in ${t.label}`,
+      hint: i === 0 ? 'double-click' : 'same conversation',
+      run: () => openRow(r, t.accountId),
+    })),
+    ...(targets.some((t) => t.tool !== r.tool) ? ['-'] : []),
+    ...targets.filter((t) => t.tool !== r.tool).map((t) => ({ label: `Continue in ${t.label}…`, hint: 'handoff', run: () => transfer([r], t.tool, t.accountId) })),
+    '-',
+    { label: 'Preview', run: () => openAgentPreview(r) },
+    { label: state.agentsMarked.has(r.key) ? 'Unmark' : 'Mark to combine', hint: 'Ctrl+click', run: () => toggleMark(r) },
+    { label: state.agentsHidden ? 'Show in the list again' : 'Hide', run: () => hideRows([r], !state.agentsHidden) },
+    { label: 'Copy session id', run: () => { ipc.clipboardWrite(r.id); toast('Copied'); } },
+  ]);
+}
+
+function combineMenu(x, y) {
+  const items = agentsCache.rows.filter((r) => state.agentsMarked.has(r.key));
+  if (items.length < 2) return toast('Mark at least two conversations to combine');
+  showContextMenu(x, y, agentTargets(null).map((t) => ({ label: `Combine into ${t.label}…`, run: () => transfer(items, t.tool, t.accountId) })));
+}
+
+async function hideRows(rows, hidden) {
+  await ipc.storesHide(rows.flatMap((r) => r.members), hidden);
+  for (const r of rows) state.agentsMarked.delete(r.key);
+  invalidateAgents();
+  toast(hidden ? 'Hidden' : 'Shown again');
+  renderHistory();
+}
+
+async function openAgentPreview(r) {
+  closePopovers();
+  state.viewer = { native: r, data: { text: 'Reading the last turns…' }, mode: 'text' };
+  $('#viewer').classList.remove('hidden');
+  $('#viewer-mode').classList.add('hidden');
+  $('#viewer-export').classList.add('hidden');
+  $('#viewer-dot').style.setProperty('--c', agentColor(r.tool));
+  $('#viewer-name').textContent = r.title;
+  $('#viewer-meta').textContent = [agentLabel(r.tool), r.cwd, `session ${r.id}`, r.via.length ? `via ${r.via.map(agentLabel).join(', ')}` : null].filter(Boolean).join(' · ');
+  renderViewer();
+  const text = await ipc.storesPreview(r.tool, r.id).catch((err) => err.message);
+  if (state.viewer && state.viewer.native === r) {
+    state.viewer.data.text = text.trim() || 'No chat turns found.';
+    renderViewer();
+    $('#viewer-text').scrollTop = 0;
+  }
+}
+
+// Resumes a conversation of the agents' stores (r: { tool, id, cwd, title }) in its own agent:
+// a Claude one under `accountId`, else (double-click, ▶) under the account new tabs use, as
+// the menu's first entry says. `prompt` (a handoff) is sent to it. A tab already on it is
+// used as it is; without a prompt, naming another account switches that tab.
+async function openNative(r, accountId, prompt) {
+  const open = agentTabOf(r);
+  if (open) {
+    if (!prompt && accountId && accountId !== tabAccount(open).id) return switchTabAccount(open, accountId);
+    activateTab(open.id); // starts a restored tab that never ran, with its prompt
+    if (prompt && open.running) submitText(open, prompt);
+    else if (prompt) {
+      open.prompt = prompt;
+      if (open.started) restartTab(open);
+    }
+    return;
+  }
+  if (!accountId && r.tool === 'claude' && multiAccount('claude')) accountId = activeAccountOf('claude').id;
+  const res = await ipc.storesOpen({ tool: r.tool, id: r.id, cwd: r.cwd, title: r.title, accountId });
+  state.settings = res.settings;
+  invalidateAgents();
+  createTab({ agent: r.tool, cwd: res.record.cwd, record: res.record, mode: 'resume', prompt });
+}
+
+const openRow = (r, accountId) => openNative(r, accountId).catch((err) => toast(err.message));
+
+// A choice in a modal: resolves to the picked option's value, or null when cancelled.
+function chooseModal(title, intro, options) {
+  return new Promise((resolve) => {
+    const body = [
+      intro ? el('p', { class: 'help' }, intro) : null,
+      el('div', { class: 'choose-list' }, ...options.map((o) =>
+        el('button', { class: 'choose-item', onclick: () => { modalOnClose = null; closeModal(); resolve(o.value); } },
+          el('b', {}, o.label), o.sub ? el('small', {}, o.sub) : null))),
+    ].filter(Boolean);
+    openModal(title, body, [{ label: 'Cancel' }]);
+    modalOnClose = () => resolve(null);
+  });
+}
+
+// Hands conversations to `tool` through the transfer planner: only the
+// messages and tool notes the destination has not seen go into a handoff file, which the
+// destination is told to read. An existing linked destination is resumed rather than a new one started.
+async function transfer(items, tool, accountId) {
+  const req = { sources: items.map((r) => r.key), tool, preview: true };
+  let plan;
+  let cwd = null;
+  try {
+    toast('Checking conversation synchronization…');
+    plan = await ipc.storesPlan(req);
+    if (plan.status === 'choose') {
+      req.target = await chooseModal(`Continue in which ${agentLabel(tool)} conversation?`, 'These conversations already carry this work. Choose one, or explicitly start a separate branch.', [
+        ...plan.candidates.map((c) => ({ label: c.title, sub: `${c.updated} · ${c.cwd} · ${c.id}`, value: c.key })),
+        { label: '+ Start a separate branch', value: '__NEW__' },
+      ]);
+      if (!req.target) return;
+      plan = await ipc.storesPlan(req);
+    }
+    if (plan.status === 'preview') {
+      if (!plan.target && items.length > 1) {
+        const cwds = [...new Set(items.map((r) => r.cwd))];
+        cwd = cwds.length > 1 ? await chooseModal('Start the combined conversation in which folder?', null, cwds.map((c) => ({ label: c, value: c }))) : cwds[0];
+        if (!cwd) return;
+      }
+      req.preview = false;
+      plan = await ipc.storesPlan(req);
+    }
+    if (plan.status === 'pending') {
+      if (plan.age < 30) return toast(`${plan.message} No new context has been marked as delivered.`);
+      const retry = await chooseModal('Retry the previous transfer?', `${plan.message} Retrying may open the destination twice if it is still starting.`, [{ label: 'Retry', value: true }]);
+      if (!retry) return;
+      req.retry = true;
+      plan = await ipc.storesPlan(req);
+    }
+    if (plan.status !== 'ready') throw new Error(`Unexpected synchronization status: ${plan.status}`);
+    const h = await ipc.storesHandoff({ plan, items, cwd });
+    state.agentsMarked.clear();
+    invalidateAgents();
+    toast(plan.handoff ? `Continuing with ${plan.count} new messages/tool notes` : 'Already synchronized; resuming without adding a prompt');
+    if (plan.target) await openNative({ tool, id: plan.target.id, cwd: plan.target.cwd, title: h.title }, accountId, h.prompt);
+    else createTab({ agent: tool, cwd: h.cwd, mode: 'new', prompt: h.prompt, accountId });
+  } catch (err) {
+    toast(`Conversation transfer stopped: ${err.message}`);
+  }
+}
+
+$('#history-agents-hidden').onclick = () => {
+  state.agentsHidden = !state.agentsHidden;
+  state.agentsMarked.clear();
+  renderHistory();
+};
+$('#history-agents-reload').onclick = async () => {
+  await agentRows(true);
+  renderHistory();
+};
+
+// ---------------------------------------------------------------------------
+// Live view: running sessions
+// ---------------------------------------------------------------------------
+
+function shortAge(since) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - since));
+  return s >= 86400 ? `${Math.floor(s / 86400)}d` : s >= 3600 ? `${Math.floor(s / 3600)}h` : s >= 60 ? `${Math.floor(s / 60)}m` : `${s}s`;
+}
+
+let liveRows = null;
+let liveBusy = false;
+async function renderLive(token) {
+  const list = $('#history-list');
+  if (!liveRows) list.replaceChildren(el('div', { class: 'h-empty' }, 'Reading running sessions…'));
+  // Each read runs Python in the backend; a slow one is not stacked on.
+  if (liveBusy) return;
+  liveBusy = true;
+  const res = await ipc.storesBoard().then((rows) => ({ rows }), (err) => ({ error: err.message })).finally(() => { liveBusy = false; });
+  if (token !== historyRender) return;
+  liveRows = res.rows || [];
+  list.replaceChildren();
+  if (res.error) return list.append(el('div', { class: 'h-empty' }, res.error));
+  const rows = liveRows.filter((r) => state.historyAgent === 'all' || r.label === state.historyAgent).sort((a, b) => b.since - a.since);
+  if (!rows.length) return list.append(el('div', { class: 'h-empty' }, 'No active sessions.'));
+  const item = (r, parent) =>
+    el('div', { class: `lv-item${parent ? ' child' : ''}`, style: `--c:${agentColor(parent ? parent.label : r.label)};--d:${r.depth || 0}` },
+      el('span', { class: `lv-state ${r.state}` }, r.state),
+      el('span', { class: 't' }, parent ? `${r.label}: ${r.title}` : r.title || r.project),
+      el('span', { class: 'm' }, [parent ? null : agentLabel(r.label), parent ? null : r.project, r.model, shortAge(r.since)].filter(Boolean).join(' · ')),
+      r.detail ? el('span', { class: 'lv-detail' }, r.detail) : null);
+  for (const r of rows) {
+    list.append(item(r));
+    for (const c of r.children.slice().sort((a, b) => b.since - a.since)) list.append(item(c, r));
+  }
+}
+setInterval(() => {
+  if (state.historyScope === 'live' && !$('#history').classList.contains('hidden')) renderHistory();
+}, 3000);
+
+// ---------------------------------------------------------------------------
 // transcript viewer
 // ---------------------------------------------------------------------------
 
@@ -1270,6 +1720,8 @@ async function openViewer(id) {
   closePopovers();
   state.viewer = { id, data, mode: data.text ? 'text' : 'raw' };
   const rec = data.record;
+  $('#viewer-mode').classList.remove('hidden');
+  $('#viewer-export').classList.remove('hidden');
   $('#viewer').classList.remove('hidden');
   $('#viewer-dot').style.setProperty('--c', agentColor(rec.agent));
   $('#viewer-name').textContent = recordTitle(rec);
@@ -1337,10 +1789,11 @@ $('#viewer-mode').addEventListener('click', (e) => {
 $('#viewer-close').onclick = closeViewer;
 $('#viewer-export').onclick = () => state.viewer && ipc.historyExport(state.viewer.id);
 $('#viewer-resume').onclick = () => {
-  if (!state.viewer) return;
-  const rec = state.viewer.data.record;
+  const v = state.viewer;
+  if (!v) return;
   closeViewer();
-  resumeRecord(rec);
+  if (v.native) openRow(v.native);
+  else resumeRecord(v.data.record);
 };
 
 // ---------------------------------------------------------------------------
@@ -1423,9 +1876,13 @@ function openModal(title, body, actions, opts = {}) {
   $('#modal').classList.remove('hidden');
 }
 
+let modalOnClose = null;
 function closeModal() {
   if (modalLocked) return;
   $('#modal').classList.add('hidden');
+  const done = modalOnClose;
+  modalOnClose = null;
+  if (done) done();
   const t = activeTab();
   if (t) t.term.focus();
 }
@@ -1444,8 +1901,11 @@ function applySaved(res) {
 function openSettings() {
   const s = state.settings;
   const restore = el('input', { type: 'checkbox' });
+  const copyOnSelect = el('input', { type: 'checkbox' });
+  copyOnSelect.checked = !!s.copyOnSelect;
   restore.checked = !!s.restoreTabs;
   const fontSize = el('input', { type: 'number', min: 8, max: 32, value: s.fontSize });
+  const agentsDays = el('input', { type: 'number', min: 1, max: 3650, value: s.agentsDays });
   const startup = {};
   const extra = {};
   for (const a of AGENT_KEYS) {
@@ -1462,9 +1922,11 @@ function openSettings() {
         el('div', { class: 'grow' }, el('div', { class: 'mono-sm' }, wsSummary), el('div', { class: 'help' }, `Agents: ${agentsSummary}`)),
         el('button', { class: 'small-btn', onclick: () => openSetup() }, 'Change…'))),
     el('label', { class: 'check' }, restore, 'Reopen and resume last tabs on startup'),
+    el('label', { class: 'check' }, copyOnSelect, 'Copy selected text to the clipboard as soon as it is selected'),
     el('div', { class: 'field' }, el('span', {}, 'Tabs to open when there is nothing to restore'),
       el('div', { class: 'row' }, ...enabledAgents().map((a) => el('label', { class: 'check' }, startup[a], agentLabel(a))))),
     el('label', { class: 'field' }, el('span', {}, 'Font size'), fontSize),
+    el('label', { class: 'field' }, el('span', {}, 'Days of conversations in History → Agents'), agentsDays),
     ...enabledAgents().map((a) => el('label', { class: 'field' }, el('span', {}, `${agentLabel(a)} extra arguments`), extra[a])),
     el('div', { class: 'help' }, `Data folder: ${state.userData}`),
   ], [
@@ -1475,11 +1937,14 @@ function openSettings() {
       run: async () => {
         const patch = {
           restoreTabs: restore.checked,
+          copyOnSelect: copyOnSelect.checked,
           fontSize: Number(fontSize.value) || 14,
+          agentsDays: Number(agentsDays.value) || 40,
           startupTabs: AGENT_KEYS.filter((a) => startup[a].checked),
           extraArgs: Object.fromEntries(AGENT_KEYS.map((a) => [a, extra[a].value.trim()])),
         };
         applySaved(await ipc.saveSettings(patch));
+        invalidateAgents();
         setFontSize(state.settings.fontSize);
       },
     },
@@ -1495,7 +1960,8 @@ const AGENT_HINTS = {
   claude: 'Claude Code CLI (npm i -g @anthropic-ai/claude-code)',
   codex: 'OpenAI Codex CLI (npm i -g @openai/codex)',
   cursor: 'Cursor Agent CLI (cursor-agent)',
-  shell: 'Plain shell tab: powershell.exe, pwsh.exe or cmd.exe',
+  opencode: 'OpenCode CLI (opencode). Its conversations are read with Python 3 (SQLite).',
+  shell: 'Plain shell tab: powershell.exe, pwsh.exe or cmd.exe; in WSL, your login shell',
 };
 
 // The accounts of one agent in Setup. Claude / Codex: a name and a config folder each;
@@ -1503,7 +1969,7 @@ const AGENT_HINTS = {
 function accountEditor(agent, st, cfg) {
   const isDir = st.accountKind === 'dir';
   const list = (cfg.accounts && cfg.accounts.length ? cfg.accounts : [{ id: 'default', name: 'Default', configDir: '' }])
-    .map((x) => ({ id: x.id, name: x.name, configDir: x.configDir || '', hasKey: !!x.hasKey, apiKey: '', clearKey: false }));
+    .map((x) => ({ id: x.id, name: x.name, configDir: x.configDir || '', uuid: x.uuid || '', hasKey: !!x.hasKey, apiKey: '', clearKey: false }));
   let active = list.some((x) => x.id === cfg.activeAccount) ? cfg.activeAccount : list[0].id;
   const wrap = el('div', { class: 'acct-list' });
   const newId = () => `acct-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -1562,13 +2028,31 @@ function accountEditor(agent, st, cfg) {
   render();
 
   const help = isDir
-    ? `Each account is a config folder (${st.configEnv}) with its own login and conversations. An empty folder is your normal login. Sign in once in a tab of a new account. The selected account is used by new tabs. To switch a tab, press Ctrl+Shift+A or click the account in the status bar. Its conversation is copied to the other account and resumed there.`
+    ? `Each account is a config folder (${st.configEnv}) with its own login. An empty folder is your normal login. Sign in once in a tab of a new account. The selected account is used by new tabs. To switch a tab, press Ctrl+Shift+A or click the account in the status bar: its conversation resumes under the other login, copied there unless the accounts share one history.${agent === 'claude' ? ' Link accounts shares ~/.claude\'s history with every ~/.claude-<n> login.' : ''}`
     : `Each account is a Cursor API key (${st.keyEnv}, from the Cursor dashboard → Integrations). An account with no key is your normal login. Keys are stored encrypted for your Windows user. The selected account is used by new tabs. To switch a tab, press Ctrl+Shift+A or click the account in the status bar.`;
   const node = el('div', { class: 'field' }, el('span', {}, 'Accounts'), wrap, el('div', { class: 'row' }, add), el('div', { class: 'help' }, help));
 
   const normDir = (p) => (p.trim() || st.defaultConfigDir || '').replace(/[\\/]+$/, '').toLowerCase();
   return {
     node,
+    refresh: render,
+    // Accounts claude-accounts.sh reported, the first being the normal login: each takes
+    // its login's uuid (which labels its conversations), and missing ones are added.
+    merge(found) {
+      found.forEach((a, i) => {
+        const dir = i === 0 ? '' : a.dir;
+        const short = a.email ? a.email.split('@')[0] : '';
+        let x = list.find((o) => normDir(o.configDir) === normDir(dir || st.defaultConfigDir || ''));
+        if (!x) {
+          x = { id: newId(), name: short || dir.split(/[\\/]/).pop(), configDir: dir, uuid: '', hasKey: false, apiKey: '', clearKey: false };
+          list.push(x);
+        } else if (short && /^(Default|Account \d+)$/.test(x.name)) {
+          x.name = short;
+        }
+        x.uuid = a.uuid || x.uuid;
+      });
+      render();
+    },
     // Why these accounts cannot be saved, or null.
     problem() {
       if (isDir) {
@@ -1590,6 +2074,7 @@ function accountEditor(agent, st, cfg) {
           id: x.id,
           name: x.name.trim() || `Account ${i + 1}`,
           configDir: isDir ? x.configDir.trim() : '',
+          ...(x.uuid ? { uuid: x.uuid } : {}),
           ...(x.apiKey.trim() ? { apiKey: x.apiKey.trim() } : {}),
           ...(x.clearKey ? { clearKey: true } : {}),
         })),
@@ -1634,6 +2119,13 @@ async function openSetup({ first = false } = {}) {
     },
   }, 'Add folder…');
 
+  // ---- where agents run ----
+  const backendSel = el('select', {},
+    el('option', { value: 'windows' }, 'Windows (native CLIs)'),
+    ...[...new Set([...info.distros, ...(s.backend.startsWith('wsl:') ? [s.backend.slice(4)] : [])])].map((d) => el('option', { value: `wsl:${d}` }, `WSL · ${d}`)));
+  backendSel.value = s.backend;
+  backendSel.addEventListener('change', () => locateSoon());
+
   // ---- agents ----
   const rows = {};
   const locateSoon = (() => {
@@ -1641,8 +2133,14 @@ async function openSetup({ first = false } = {}) {
     return () => {
       clearTimeout(timer);
       timer = setTimeout(async () => {
-        const found = await ipc.setupLocate(Object.fromEntries(AGENT_KEYS.map((a) => [a, rows[a].command.value.trim()])));
-        for (const a of AGENT_KEYS) rows[a].setFound(found[a]);
+        const res = await ipc.setupLocate(backendSel.value, Object.fromEntries(AGENT_KEYS.map((a) => [a, rows[a].command.value.trim()]))).catch(() => ({ found: {}, configDirs: {} }));
+        for (const a of AGENT_KEYS) {
+          rows[a].setFound(res.found[a]);
+          if (rows[a].accounts && res.configDirs[a]) {
+            status[a].defaultConfigDir = res.configDirs[a];
+            rows[a].accounts.refresh();
+          }
+        }
       }, 250);
     };
   })();
@@ -1671,9 +2169,25 @@ async function openSetup({ first = false } = {}) {
       },
     }, 'Browse…');
     const accounts = st.accountKind ? accountEditor(a, st, cfg) : null;
+    // claude-accounts.sh in the chosen backend: link (or create) ~/.claude-<n> logins.
+    const linkNote = el('div', { class: 'help' });
+    const linkAccounts = async (create) => {
+      linkNote.textContent = 'Linking…';
+      try {
+        const res = await ipc.storesClaudeAccounts({ backend: backendSel.value, create });
+        accounts.merge(res.accounts);
+        linkNote.textContent = [`${plural(res.accounts.length, 'account')} share ~/.claude's history.`, ...res.notes].join(' ');
+      } catch (err) {
+        linkNote.textContent = err.message;
+      }
+    };
+    const link = a === 'claude' ? el('button', { class: 'small-btn', title: 'Link every ~/.claude-<n> login to ~/.claude\'s history (keeps each login; sets aside, never deletes)', onclick: () => linkAccounts(false) }, 'Link accounts') : null;
+    const addLinked = a === 'claude' ? el('button', { class: 'small-btn', title: 'Create the next ~/.claude-<n> and link it; sign in once in a tab of it', onclick: () => linkAccounts(true) }, 'New linked account') : null;
     const body = el('div', { class: 'agent-body' },
       el('label', { class: 'field' }, el('span', {}, 'Command'), el('div', { class: 'row' }, command, browseCmd)),
-      accounts && accounts.node);
+      accounts && accounts.node,
+      link ? el('div', { class: 'row' }, link, addLinked) : null,
+      link ? linkNote : null);
     const card = el('div', { class: 'agent-card', style: `--c:${agentColor(a)}` },
       el('div', { class: 'agent-head' },
         el('label', { class: 'check' }, enabled, el('span', { class: 'badge' }, BADGE[a]), el('b', {}, agentLabel(a))),
@@ -1688,6 +2202,7 @@ async function openSetup({ first = false } = {}) {
   });
 
   renderRoots();
+  if (backendSel.value !== s.backend) locateSoon();
   const body = [
     first ? el('p', { class: 'setup-intro' }, 'Choose the folders the agents work in and how each agent is started. You can change this later in Settings.') : null,
     el('div', { class: 'setup-section' },
@@ -1695,6 +2210,10 @@ async function openSetup({ first = false } = {}) {
       el('div', { class: 'help' }, 'New tabs open in the first folder. Git repositories inside these folders (up to two levels down, e.g. repos/<name>) are listed in the new-tab folder picker and the History Folder view.'),
       wsList,
       el('div', { class: 'row' }, addFolder)),
+    el('div', { class: 'setup-section' },
+      el('h4', {}, 'Where agents run'),
+      el('div', { class: 'help' }, 'New tabs run their agent here. In WSL, the CLIs installed inside the distro run in its login shell, and their stores are read over \\\\wsl$. A conversation always resumes where it was started.'),
+      el('div', { class: 'row' }, backendSel)),
     el('div', { class: 'setup-section' }, el('h4', {}, 'Agents'), ...agentCards),
   ].filter(Boolean);
 
@@ -1718,7 +2237,8 @@ async function openSetup({ first = false } = {}) {
     const startupTabs = (state.settings.startupTabs || []).filter((a) => agents[a].enabled);
     let res;
     try {
-      res = await ipc.saveSettings({ setupDone: true, workspaces: roots, agents, startupTabs });
+      res = await ipc.saveSettings({ setupDone: true, workspaces: roots, agents, startupTabs, backend: backendSel.value });
+      invalidateAgents();
     } catch (err) {
       toast(err.message);
       return false;
@@ -1829,6 +2349,16 @@ ipc.onSessionUpdate(({ tabId, record, previousId, replacedId, at }) => {
   renderHistory();
   saveState();
 });
+
+// Claude's own busy / idle, read from its pid file.
+ipc.onStatus(({ tabId, status }) => {
+  const tab = state.tabs.find((t) => t.id === tabId);
+  if (!tab) return;
+  tab.status = status;
+  renderTabs();
+});
+
+ipc.onNotice((msg) => toast(msg));
 
 ipc.onBeforeClose(async () => {
   try {

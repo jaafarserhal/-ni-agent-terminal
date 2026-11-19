@@ -38,7 +38,7 @@
       </div>
     </label>
     <div id="new-agents"></div>
-    <div class="popover-hint">Ctrl+Shift+1…4 opens an agent in the current tab's folder</div>
+    <div class="popover-hint">Ctrl+Shift+1…5 opens an agent in the current tab's folder</div>
   </div>
 
   <main id="main">
@@ -87,16 +87,25 @@
         <button data-scope="tab" class="on" title="Prompts and conversations of the active tab">This tab</button>
         <button data-scope="folder" title="Sessions started in one folder">Folder</button>
         <button data-scope="all" title="Every session, all folders">All</button>
+        <button data-scope="agents" title="Every Claude, Codex and OpenCode conversation in the agents' own stores, across folders and agents">Agents</button>
+        <button data-scope="live" title="Running sessions with their state, model, last action and subagents">Live</button>
       </div>
       <div id="history-folder-row" class="folder-row hidden">
         <select id="history-folder-select" title="Folder"></select>
         <button id="history-import" class="small-btn hidden" title="Add conversations found in the agents' own stores for this folder"></button>
+      </div>
+      <div id="history-agents-row" class="folder-row hidden">
+        <span id="history-agents-marked" class="agents-marked"></span>
+        <span class="st-fill"></span>
+        <button id="history-agents-hidden" class="small-btn" title="List the hidden conversations">Hidden</button>
+        <button id="history-agents-reload" class="small-btn" title="Read the agents' stores again">Reload</button>
       </div>
       <div class="seg filter" id="history-filter">
         <button data-agent="all" class="on">All</button>
         <button data-agent="claude">Claude</button>
         <button data-agent="codex">Codex</button>
         <button data-agent="cursor">Cursor</button>
+        <button data-agent="opencode">OpenCode</button>
         <button data-agent="shell">Shell</button>
       </div>
       <input id="history-search" class="search" placeholder="Search title, folder or id" spellcheck="false" />

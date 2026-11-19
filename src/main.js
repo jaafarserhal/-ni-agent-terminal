@@ -1,19 +1,62 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, shell, Menu, clipboard, screen, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu, clipboard, screen, safeStorage, nativeImage } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const pty = require('node-pty');
 
-const { AGENTS, buildEnv, resolveLaunch, locate, agentEnv } = require('./agents');
-const { listSessions, claudeLiveSession, claudeSessionExists, copyConversation, nativeTitle, samePath, normPath } = require('./sessions');
+const { AGENTS, buildEnv, resolveLaunch, agentArgs, locate, agentEnv } = require('./agents');
+const { listSessions, claudeLive, claudePids, claudeFindPid, claudeSessionExists, copyConversation, nativeTitle, samePath, normPath } = require('./sessions');
 const { History } = require('./history');
+const { backendFor, wslDistros, shQuote } = require('./backend');
+const { Engine, ENGINE_AGENTS } = require('./engine');
 const workspace = require('./workspace');
 
 // Test hooks: an isolated data folder, and a screenshot-then-quit smoke run.
 if (process.env.NI_TERM_USERDATA) app.setPath('userData', process.env.NI_TERM_USERDATA);
 const SMOKE_SHOT = process.env.NI_TERM_SMOKE || null;
+
+// The taskbar groups windows, and a pinned shortcut, by this id: the installer's, set here
+// too so a run from source matches the shortcut --install-shortcut writes.
+const APP_ID = 'com.ni.agentterminal';
+app.setAppUserModelId(APP_ID);
+
+// --install-shortcut (npm run shortcut): writes a Start menu shortcut, which can be pinned,
+// and quits. From source it starts this checkout with its own Electron, so it keeps working
+// after code changes; from a build it starts that .exe.
+function installShortcut() {
+  const fromSource = process.defaultApp;
+  const name = fromSource ? 'NI Agent Terminal (source)' : 'NI Agent Terminal';
+  const file = path.join(app.getPath('appData'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', `${name}.lnk`);
+  // A shortcut icon must be an .ico: one 256 px PNG entry.
+  const png = nativeImage.createFromPath(path.join(__dirname, 'icon.png')).resize({ width: 256, height: 256 }).toPNG();
+  const head = Buffer.alloc(22);
+  head.writeUInt16LE(1, 2);
+  head.writeUInt16LE(1, 4);
+  head.writeUInt16LE(1, 10);
+  head.writeUInt16LE(32, 12);
+  head.writeUInt32LE(png.length, 14);
+  head.writeUInt32LE(22, 18);
+  const icon = path.join(app.getPath('userData'), 'shortcut.ico');
+  fs.mkdirSync(path.dirname(icon), { recursive: true });
+  fs.writeFileSync(icon, Buffer.concat([head, png]));
+  const ok = shell.writeShortcutLink(file, {
+    target: process.env.PORTABLE_EXECUTABLE_FILE || process.execPath,
+    args: fromSource ? `"${app.getAppPath()}"` : '',
+    cwd: fromSource ? app.getAppPath() : path.dirname(process.execPath),
+    icon,
+    iconIndex: 0,
+    appUserModelId: APP_ID,
+    description: 'Multi-tab terminal for coding agents',
+  });
+  console.log(ok ? `Start menu shortcut written: ${file}` : `Could not write ${file}`);
+  return ok;
+}
+
+if (process.argv.includes('--install-shortcut')) {
+  process.exit(installShortcut() ? 0 : 1);
+}
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -23,11 +66,13 @@ if (!app.requestSingleInstanceLock()) {
 const userData = app.getPath('userData');
 const settingsFile = path.join(userData, 'settings.json');
 const stateFile = path.join(userData, 'state.json');
+const tmpDir = path.join(userData, 'tmp');
 
 const DEFAULT_AGENTS = {
   claude: { enabled: true, command: '' },
   codex: { enabled: true, command: '' },
   cursor: { enabled: true, command: '' },
+  opencode: { enabled: false, command: '' },
   shell: { enabled: true, command: '' },
 };
 
@@ -37,11 +82,16 @@ const DEFAULT_SETTINGS = {
   workspaces: [],
   agents: DEFAULT_AGENTS,
   restoreTabs: true,
+  copyOnSelect: false,
   fontSize: 14,
   fontFamily: "'Cascadia Mono', 'Cascadia Code', Consolas, 'Courier New', monospace",
   scrollback: 20000,
-  extraArgs: { claude: '', codex: '', cursor: '', shell: '' },
+  extraArgs: { claude: '', codex: '', cursor: '', opencode: '', shell: '' },
   startupTabs: ['claude', 'codex', 'cursor'],
+  // Where new tabs run their agents: 'windows' or 'wsl:<distro>'.
+  backend: 'windows',
+  // How far back History → Agents lists conversations.
+  agentsDays: 40,
 };
 
 function readJson(file, fallback) {
@@ -67,6 +117,8 @@ function normalizeSettings(s) {
   if (!out.workspaces.length && s.workspaceRoot) out.workspaces = [s.workspaceRoot];
   out.workspaces = out.workspaces.filter((p) => typeof p === 'string' && p.trim());
   delete out.workspaceRoot;
+  out.backend = typeof out.backend === 'string' && /^(windows|wsl:.+)$/.test(out.backend) ? out.backend : 'windows';
+  out.agentsDays = Math.max(1, Number(out.agentsDays) || DEFAULT_SETTINGS.agentsDays);
   const agents = {};
   for (const id of Object.keys(DEFAULT_AGENTS)) {
     const a = (s.agents && s.agents[id]) || {};
@@ -99,6 +151,8 @@ function normalizeAccounts(agentId, a) {
         name: (typeof x.name === 'string' && x.name.trim()) || (i === 0 ? 'Default' : `Account ${i + 1}`),
         configDir: kind === 'dir' && typeof x.configDir === 'string' ? x.configDir.trim() : '',
       };
+      // The login a linked Claude account reported (claude-accounts.sh): labels its conversations.
+      if (typeof x.uuid === 'string' && x.uuid) acct.uuid = x.uuid;
       if (kind === 'key' && typeof x.apiKeyEnc === 'string' && x.apiKeyEnc) acct.apiKeyEnc = x.apiKeyEnc;
       return acct;
     });
@@ -144,6 +198,26 @@ let settings = normalizeSettings(readJson(settingsFile, {}));
 // The portable build unpacks to a temp folder; PORTABLE_EXECUTABLE_DIR is where the user put the .exe.
 const exeDir = process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(app.getPath('exe'));
 
+// ---------------------------------------------------------------------------
+// Backends and stores
+// ---------------------------------------------------------------------------
+
+const backend = (key) => backendFor(key, tmpDir);
+const newBackend = () => backend(settings.backend);
+// Records from before backends ran on Windows.
+const backendOf = (rec) => backend(rec && rec.backend);
+const engineFor = (b) => new Engine(b, userData);
+
+// An agent's store as Windows reaches it, for one of its accounts (configDir: the agent's
+// own path, '' for the normal login): for a linked account, the shared one it links to.
+// Cursor keeps one chats folder; OpenCode a database.
+async function storeDir(b, agent, configDir) {
+  if (agent === 'cursor') return b.kind === 'windows' && process.env.CURSOR_CHATS_DIR ? process.env.CURSOR_CHATS_DIR : b.toWin(b.agentPath('.cursor', 'chats'));
+  if (agent === 'opencode') return b.toWin(b.opencodeDb());
+  if (!AGENTS[agent].configEnv) return null;
+  return b.toWin(await b.storeRoot(configDir || b.configDir(agent)));
+}
+
 // The workspace folder a working directory belongs to, else the first one.
 function workspaceFor(cwd) {
   return workspace.containingRoot(settings.workspaces, cwd) || settings.workspaces[0] || null;
@@ -176,23 +250,38 @@ function accountForRecord(rec) {
   return null;
 }
 
-function agentStatus() {
-  const env = buildEnv({});
+// Where each command resolves in the backend: { claude: path|null, ... }.
+async function locateAll(b, commands) {
+  const ids = Object.keys(AGENTS);
+  if (b.kind === 'windows') {
+    const env = buildEnv({});
+    return Object.fromEntries(ids.map((id) => [id, locate(id, commands[id], env)]));
+  }
+  await b.ready();
+  // A WSL shell tab with no command runs the login shell, which is always there.
+  const names = ids.map((id) => (commands[id] || '').trim() || (id === 'shell' ? 'bash' : AGENTS[id].command));
+  const found = await b.locate(names);
+  return Object.fromEntries(ids.map((id, i) => [id, found[i]]));
+}
+
+async function agentStatus() {
+  const b = newBackend();
+  // An unreachable WSL distro lists every agent as not found rather than failing the window.
+  const found = await locateAll(b, Object.fromEntries(Object.keys(AGENTS).map((id) => [id, agentCfg(id).command]))).catch(() => ({}));
   return Object.values(AGENTS).map((a) => {
     const cfg = agentCfg(a.id);
-    const found = locate(a.id, cfg.command, env);
     return {
       id: a.id,
       label: a.label,
       color: a.color,
       enabled: cfg.enabled,
-      available: !!found,
-      path: found,
-      defaultCommand: a.command,
+      available: !!found[a.id],
+      path: found[a.id],
+      defaultCommand: b.kind === 'wsl' && a.id === 'shell' ? 'login shell' : a.command,
       accountKind: a.accountKind || null,
       configEnv: a.configEnv || null,
       keyEnv: a.keyEnv || null,
-      defaultConfigDir: a.defaultConfigDir || null,
+      defaultConfigDir: a.configEnv && b.home ? b.configDir(a.id) : null,
     };
   });
 }
@@ -212,6 +301,7 @@ function publicRecord(rec) {
   const acct = accountForRecord(rec);
   return {
     ...rec,
+    backendLabel: rec.backend && rec.backend !== 'windows' ? backendOf(rec).label : null,
     cwdLabel: workspace.labelFor(roots, rec.cwd),
     branch: workspace.readBranch(rec.cwd),
     accountId: acct ? acct.id : rec.accountId || null,
@@ -229,11 +319,45 @@ function publicRecord(rec) {
 // is listed and resumable on its own.
 //
 // Claude: ~/.claude/sessions/<pid>.json names the current session exactly.
-// Codex / Cursor: a conversation created in the tab's folder is attributed to the tab
-// in which Enter was pressed just before it appeared (or that had just started).
+// Codex / Cursor / OpenCode: a conversation created in the tab's folder is attributed to
+// the tab in which Enter was pressed just before it appeared (or that had just started).
+// Each tab reads its own backend's store: s.store, with the folder as the agent sees it (s.agentCwd).
 
 const TRACK_MS = 2000;
 const TITLE_MS = 20000;
+const OPENCODE_MS = 5000;
+
+// OpenCode's sessions per backend, refreshed through Python while an OpenCode tab runs.
+const opencodeCache = new Map(); // backend key -> { at, busy, list }
+function opencodeList(b, cwd, since) {
+  const c = opencodeCache.get(b.key);
+  return c ? c.list.filter((x) => x.t >= since && samePath(x.cwd, cwd)) : [];
+}
+function refreshOpencode() {
+  const live = [...sessions.values()].filter((s) => s.agent === 'opencode');
+  for (const b of new Set(live.map((s) => s.backend))) {
+    const c = opencodeCache.get(b.key) || { at: 0, busy: false, list: [] };
+    opencodeCache.set(b.key, c);
+    if (c.busy || Date.now() - c.at < OPENCODE_MS) continue;
+    c.busy = true;
+    const since = Math.min(...live.filter((s) => s.backend === b).map((s) => s.since)) - 5000;
+    engineFor(b).opencodeSessions(since)
+      .then((list) => { c.list = list; })
+      .catch(() => {})
+      .finally(() => { c.busy = false; c.at = Date.now(); });
+  }
+}
+
+function listFor(s, since) {
+  return s.agent === 'opencode' ? opencodeList(s.backend, s.agentCwd, since) : listSessions(s.agent, s.agentCwd, since, s.store);
+}
+
+function titleFor(s, nativeId) {
+  if (s.agent !== 'opencode') return nativeTitle(s.agent, s.agentCwd, nativeId, s.store);
+  const c = opencodeCache.get(s.backend.key);
+  const hit = c && c.list.find((x) => x.id === nativeId);
+  return (hit && hit.title) || null;
+}
 
 function liveTabOf(agent, nativeId, exceptTab) {
   for (const [tabId, s] of sessions) {
@@ -265,7 +389,7 @@ function ownerOf(agent, cwd, birth) {
 // wrote it, or only slash commands were sent. It is replaced rather than kept.
 function isThrowaway(rec, s) {
   if (rec.createdAt < s.since - 1000) return false;
-  if (rec.agent === 'claude' && rec.nativeId && !claudeSessionExists(rec.cwd, rec.nativeId, rec.configDir)) return true;
+  if (rec.agent === 'claude' && rec.nativeId && !claudeSessionExists(s.agentCwd, rec.nativeId, s.store)) return true;
   return history.prompts(rec.id).every((p) => p.text.startsWith('/'));
 }
 
@@ -290,7 +414,7 @@ function switchConversation(tabId, s, rec, target) {
     // First sight of the conversation, or the earlier one was empty: fill it in.
     next = history.update(rec.id, { nativeId: target.id, title: rec.nativeId ? null : rec.title });
   } else {
-    next = history.create({ agent: s.agent, cwd: rec.cwd, nativeId: target.id, workspaceRoot: rec.workspaceRoot, configDir: rec.configDir, accountId: rec.accountId, parentId: rec.id });
+    next = history.create({ agent: s.agent, cwd: rec.cwd, nativeId: target.id, workspaceRoot: rec.workspaceRoot, configDir: rec.configDir, accountId: rec.accountId, backend: rec.backend, parentId: rec.id });
     history.endRun(rec.id);
     history.beginRun(next.id, 'new conversation in this tab', { switched: true });
     history.movePrompts(rec.id, next.id, target.birth - 1500);
@@ -308,7 +432,21 @@ function switchConversation(tabId, s, rec, target) {
   });
 }
 
-function trackTab(tabId, s, listFor) {
+// Claude's pid file: the tab's own pid on Windows (npm shims are unwrapped), else (WSL
+// runs wsl.exe) the one claudeFindPid picks. A found pid is the tab's, so no time checks.
+function claudeLiveOf(tabId, s, rec) {
+  if (!s.claudePid && claudeLive(s.pty.pid, s.agentCwd, s.since, s.store)) s.claudePid = s.pty.pid;
+  if (!s.claudePid && s.backend.kind === 'wsl') {
+    const taken = new Set([...sessions.entries()].filter(([id, o]) => id !== tabId && o.claudePid).map(([, o]) => o.claudePid));
+    s.claudePid = claudeFindPid(s.agentCwd, s.store, rec.nativeId, taken, s.pidsBefore) || null;
+  }
+  const live = s.claudePid && claudeLive(s.claudePid, s.agentCwd, s.claudePid === s.pty.pid ? s.since : 0, s.store);
+  // Its file is gone (that Claude exited inside the tab): look again.
+  if (s.claudePid && !live && s.backend.kind === 'wsl') s.claudePid = null;
+  return live;
+}
+
+function trackTab(tabId, s, listCached) {
   const rec = history.get(s.recordId);
   if (!rec) return;
   const now = Date.now();
@@ -316,15 +454,19 @@ function trackTab(tabId, s, listFor) {
   let target = null;
 
   if (s.agent === 'claude') {
-    const id = claudeLiveSession(s.pty.pid, rec.cwd, s.since, s.configDir);
-    if (id) {
+    const live = claudeLiveOf(tabId, s, rec);
+    if (live) {
       s.exact = true;
       const birth = s.enters.length ? s.enters[s.enters.length - 1] : now;
-      if (id !== rec.nativeId && (!rec.nativeId || enteredThisRun)) target = { id, birth };
+      if (live.sessionId !== rec.nativeId && (!rec.nativeId || enteredThisRun)) target = { id: live.sessionId, birth };
+      if (live.status !== s.status) {
+        s.status = live.status;
+        send('session:status', { tabId, status: live.status });
+      }
     }
   }
   if (!target && !s.exact) {
-    const cands = listFor(s.agent, rec.cwd, s.configDir).filter((c) => c.t >= s.since - 2000 && c.id !== rec.nativeId && !liveTabOf(s.agent, c.id, tabId));
+    const cands = listCached(s).filter((c) => c.t >= s.since - 2000 && c.id !== rec.nativeId && !liveTabOf(s.agent, c.id, tabId));
     const mine = cands
       .filter((c) => c.birth >= Math.max(s.since, s.lastSwitchAt) - 2000)
       .map((c) => ({ c, owner: ownerOf(s.agent, rec.cwd, c.birth) }))
@@ -345,7 +487,7 @@ function trackTab(tabId, s, listFor) {
   const cur = history.get(s.recordId);
   if (cur && cur.nativeId && !cur.customTitle && now - s.titleAt > (cur.title ? TITLE_MS : TRACK_MS)) {
     s.titleAt = now;
-    const title = nativeTitle(s.agent, cur.cwd, cur.nativeId, cur.configDir);
+    const title = titleFor(s, cur.nativeId);
     if (title && title !== cur.title) {
       history.update(cur.id, { title });
       send('session:update', { tabId, record: publicRecord(cur) });
@@ -354,20 +496,21 @@ function trackTab(tabId, s, listFor) {
 }
 
 function trackSessions() {
+  refreshOpencode();
   const cache = new Map();
-  const listFor = (agent, cwd, dir) => {
-    const key = `${agent}|${normPath(cwd)}|${dir || ''}`;
+  const listCached = (s) => {
+    const key = `${s.agent}|${normPath(s.agentCwd)}|${s.store || ''}`;
     if (!cache.has(key)) {
       let since = Date.now();
-      for (const s of sessions.values()) if (s.agent === agent) since = Math.min(since, s.since);
-      cache.set(key, listSessions(agent, cwd, since - 5000, dir));
+      for (const o of sessions.values()) if (o.agent === s.agent) since = Math.min(since, o.since);
+      cache.set(key, listFor(s, since - 5000));
     }
     return cache.get(key);
   };
   for (const [tabId, s] of [...sessions]) {
     if (s.agent === 'shell' || sessions.get(tabId) !== s) continue;
     try {
-      trackTab(tabId, s, listFor);
+      trackTab(tabId, s, listCached);
     } catch (err) {
       if (SMOKE_SHOT) console.log(`[track ${tabId}] ${err.stack}`);
     }
@@ -375,20 +518,29 @@ function trackSessions() {
 }
 setInterval(trackSessions, TRACK_MS);
 
-function startPty({ tabId, agent, cwd, recordId, mode, accountId, cols, rows }) {
+// `prompt`: a first message for the agent, sent as a launch argument (a handoff).
+async function startPty({ tabId, agent, cwd, recordId, mode, accountId, cols, rows, prompt }) {
   if (!AGENTS[agent]) throw new Error(`Unknown agent ${agent}`);
-  stopPty(tabId);
 
   const cfg = agentCfg(agent);
   let rec = recordId ? history.get(recordId) : null;
   let runMode = mode || 'new';
+  const b = rec ? backendOf(rec) : newBackend();
+  await b.ready();
+  // The account folder is kept with the record: the conversation lives in that
+  // folder's store, so resuming it later must use the same one.
+  const acct = rec ? null : accountById(agent, accountId) || activeAccount(agent);
+  const configDir = rec ? rec.configDir : (acct && acct.configDir) || null;
+  const store = await storeDir(b, agent, configDir);
+  // Only now, with nothing left to await: a second start of the same tab must not slip in between.
+  stopPty(tabId);
 
   if (rec) {
     cwd = rec.cwd;
     if (agent === 'claude' && rec.nativeId) {
       // A Claude session that never received a message was never written to disk;
       // start it fresh under the same id instead of failing to resume.
-      runMode = claudeSessionExists(rec.cwd, rec.nativeId, rec.configDir) ? 'resume' : 'new';
+      runMode = claudeSessionExists(b.toAgent(rec.cwd), rec.nativeId, store) ? 'resume' : 'new';
     } else if (rec.nativeId) {
       runMode = 'resume';
     } else if (runMode === 'resume') {
@@ -397,36 +549,43 @@ function startPty({ tabId, agent, cwd, recordId, mode, accountId, cols, rows }) 
   } else {
     if (!cwd || !fs.existsSync(cwd)) cwd = settings.workspaces.find((p) => fs.existsSync(p)) || require('os').homedir();
     const nativeId = agent === 'claude' && runMode === 'new' ? crypto.randomUUID() : null;
-    // The account folder is kept with the record: the conversation lives in that
-    // folder's store, so resuming it later must use the same one.
-    const acct = accountById(agent, accountId) || activeAccount(agent);
-    rec = history.create({ agent, cwd, nativeId, workspaceRoot: workspaceFor(cwd), configDir: (acct && acct.configDir) || null, accountId: acct ? acct.id : null });
+    rec = history.create({ agent, cwd, nativeId, workspaceRoot: workspaceFor(cwd), configDir, accountId: acct ? acct.id : null, backend: b.key });
   }
   // Cursor's account is an API key; a record whose account was removed uses the current one.
   const keyAcct = AGENTS[agent].accountKind === 'key' ? accountForRecord(rec) || activeAccount(agent) : null;
   const apiKey = keyAcct ? decryptKey(keyAcct.apiKeyEnc) : null;
   if (keyAcct && keyAcct.apiKeyEnc && !apiKey) throw new Error(`The API key of ${AGENTS[agent].label} account "${keyAcct.name}" cannot be read. Enter it again in Setup.`);
   if (!fs.existsSync(cwd)) throw new Error(`Working folder no longer exists: ${cwd}`);
-  if (rec.configDir && !fs.existsSync(rec.configDir)) fs.mkdirSync(rec.configDir, { recursive: true });
+  if (rec.configDir && !fs.existsSync(b.toWin(rec.configDir))) fs.mkdirSync(b.toWin(rec.configDir), { recursive: true });
 
   const root = workspaceFor(cwd);
-  const env = buildEnv({
+  const tabEnv = {
     AGENT_TERMINAL: '1',
-    AGENT_TERMINAL_WORKSPACE: root || '',
+    AGENT_TERMINAL_WORKSPACE: root ? b.toAgent(root) : '',
     AGENT_TERMINAL_SESSION: rec.id,
     // Names used by 1.x; kept so existing scripts and instructions keep working.
-    NI_WORKSPACE: root || '',
+    NI_WORKSPACE: root ? b.toAgent(root) : '',
     NI_AGENT_TERMINAL: '1',
     NI_AGENT_TERMINAL_SESSION: rec.id,
-    ...agentEnv(agent, rec.configDir, apiKey),
-  });
-  const launch = resolveLaunch(agent, runMode, rec.nativeId, settings.extraArgs[agent], env, cfg.command);
+    ...agentEnv(agent, rec.configDir, apiKey, b.kind === 'wsl'),
+  };
+  const run = { mode: runMode, nativeId: rec.nativeId, extraArgs: settings.extraArgs[agent], prompt, inlineSettings: b.toAgent(inlineSettingsFile()) };
+  let launch;
+  let env;
+  if (b.kind === 'wsl') {
+    const command = cfg.command || (agent === 'shell' ? '' : AGENTS[agent].command);
+    launch = b.launch({ cwd, env: { TERM: 'xterm-256color', COLORTERM: 'truecolor', ...tabEnv }, command, args: agentArgs(agent, { ...run, file: command }) });
+    env = buildEnv(launch.env);
+  } else {
+    env = buildEnv(tabEnv);
+    launch = { ...resolveLaunch(agent, run, env, cfg.command), cwd };
+  }
 
   const proc = pty.spawn(launch.file, launch.args, {
     name: 'xterm-256color',
     cols: Math.max(cols || 120, 20),
     rows: Math.max(rows || 30, 5),
-    cwd,
+    cwd: launch.cwd,
     env,
     useConpty: true,
   });
@@ -435,6 +594,9 @@ function startPty({ tabId, agent, cwd, recordId, mode, accountId, cols, rows }) 
     pty: proc,
     agent,
     mode: runMode,
+    backend: b,
+    agentCwd: b.toAgent(cwd),
+    store,
     configDir: rec.configDir || null,
     recordId: rec.id,
     since: Date.now(),
@@ -442,6 +604,9 @@ function startPty({ tabId, agent, cwd, recordId, mode, accountId, cols, rows }) 
     titleAt: 0,
     enters: [], // when Enter was sent, newest last; ties new conversations to this tab
     exact: false, // Claude's pid file is being read
+    claudePid: null,
+    pidsBefore: agent === 'claude' && b.kind === 'wsl' ? claudePids(store) : null,
+    status: null, // Claude's own 'busy' / 'idle'
     buf: '',
     flushTimer: null,
   };
@@ -485,6 +650,21 @@ function startPty({ tabId, agent, cwd, recordId, mode, accountId, cols, rows }) 
   return { record: publicRecord(rec), display: launch.display, mode: runMode };
 }
 
+// Claude's --settings for every tab: its classic TUI, which keeps output in the normal buffer.
+function inlineSettingsFile() {
+  const file = path.join(userData, 'claude-inline-settings.json');
+  if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify({ tui: 'default' }));
+  return file;
+}
+
+// Paths dropped on a tab, quoted for its shell and translated for its backend.
+function dropText(tabId, paths) {
+  const s = sessions.get(tabId);
+  if (!s) return '';
+  if (s.backend.kind === 'windows') return paths.map((p) => (/[\s&()^'"]/.test(p) ? `"${p}"` : p)).join(' ') + ' ';
+  return paths.map((p) => shQuote(s.backend.toAgent(p))).join(' ') + ' ';
+}
+
 // Resolves once the process has exited (or after a few seconds).
 function stopPty(tabId) {
   const s = sessions.get(tabId);
@@ -516,8 +696,11 @@ async function switchAccount({ tabId, recordId, accountId }) {
   if (s) await stopPty(tabId);
   let copied = true;
   if (agent.accountKind === 'dir' && !sameDir(rec.configDir, acct.configDir)) {
-    if (acct.configDir) fs.mkdirSync(acct.configDir, { recursive: true });
-    copied = !rec.nativeId || copyConversation(rec.agent, rec.cwd, rec.nativeId, rec.configDir, acct.configDir || null);
+    const b = backendOf(rec);
+    await b.ready();
+    const to = await storeDir(b, rec.agent, acct.configDir);
+    fs.mkdirSync(to, { recursive: true });
+    copied = !rec.nativeId || copyConversation(rec.agent, b.toAgent(rec.cwd), rec.nativeId, await storeDir(b, rec.agent, rec.configDir), to);
   }
   history.update(rec.id, { accountId: acct.id, configDir: agent.accountKind === 'dir' ? acct.configDir || null : rec.configDir });
   if (settings.agents[rec.agent].activeAccount !== acct.id) {
@@ -541,7 +724,7 @@ function handle(channel, fn) {
   });
 }
 
-handle('app:init', () => {
+handle('app:init', async () => {
   const state = readJson(stateFile, { tabs: [] });
   const restore = settings.restoreTabs
     ? (state.tabs || [])
@@ -556,7 +739,7 @@ handle('app:init', () => {
     version: app.getVersion(),
     settings: publicSettings(),
     workspace: workspace.describe(settings.workspaces),
-    agents: agentStatus(),
+    agents: await agentStatus(),
     restore,
     activeIndex: state.activeIndex || 0,
     userData,
@@ -564,6 +747,19 @@ handle('app:init', () => {
 });
 
 handle('pty:start', (opts) => startPty(opts));
+handle('pty:dropText', ({ tabId, paths }) => dropText(tabId, paths || []));
+
+// The clipboard's image saved as a PNG, as text to paste into the tab: its path, quoted and
+// translated for the tab's backend. For agents that cannot read the Windows clipboard
+// themselves (Codex in WSL): they attach a pasted image path. Kept until clearTmp.
+handle('clipboard:imagePath', (tabId) => {
+  const img = clipboard.readImage();
+  if (img.isEmpty()) return '';
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const file = path.join(tmpDir, `clipboard-${new Date().toISOString().replace(/[:.]/g, '-')}.png`);
+  fs.writeFileSync(file, img.toPNG());
+  return dropText(tabId, [file]);
+});
 handle('pty:kill', (tabId) => { stopPty(tabId); });
 handle('pty:switchAccount', (opts) => switchAccount(opts || {}));
 ipcMain.on('pty:write', (_e, { tabId, data }) => {
@@ -591,9 +787,13 @@ handle('history:get', (ids) => (ids || []).map((id) => publicRecord(history.get(
 
 // Conversations in the agents' own stores for this folder that history has no record of,
 // e.g. ones started outside the app, or before conversation tracking existed.
+// In the new-tab backend; OpenCode's are in the Agents view.
 const IMPORT_DAYS = 60;
-function importable(cwd) {
+async function importable(cwd) {
   const since = Date.now() - IMPORT_DAYS * 86400000;
+  const b = newBackend();
+  await b.ready();
+  const agentCwd = b.toAgent(cwd);
   const out = [];
   for (const agent of ['claude', 'codex', 'cursor']) {
     const cfg = agentCfg(agent);
@@ -605,21 +805,22 @@ function importable(cwd) {
       : [null];
     for (const dir of dirs) {
       const acct = kind === 'dir' ? (cfg.accounts || []).find((x) => sameDir(x.configDir, dir)) : null;
-      for (const c of listSessions(agent, cwd, since, dir)) {
+      const store = await storeDir(b, agent, dir);
+      for (const c of listSessions(agent, agentCwd, since, store)) {
         if (history.findByNative(agent, c.id) || liveTabOf(agent, c.id, null) || out.some((x) => x.agent === agent && x.id === c.id)) continue;
-        const title = nativeTitle(agent, cwd, c.id, dir) || c.title || null;
+        const title = nativeTitle(agent, agentCwd, c.id, store) || c.title || null;
         // A Claude session holding nothing but a /clear has no title to show.
         if (agent === 'claude' && !title) continue;
-        out.push({ agent, id: c.id, title, birth: c.birth, t: c.t, configDir: dir, accountId: acct ? acct.id : null });
+        out.push({ agent, id: c.id, title, birth: c.birth, t: c.t, configDir: dir, accountId: acct ? acct.id : null, backend: b.key });
       }
     }
   }
   return out.sort((a, b) => b.t - a.t);
 }
 handle('history:importable', (cwd) => (cwd && fs.existsSync(cwd) ? importable(cwd) : []));
-handle('history:import', (cwd) => {
+handle('history:import', async (cwd) => {
   let n = 0;
-  for (const c of importable(cwd)) {
+  for (const c of await importable(cwd)) {
     const rec = history.create({
       agent: c.agent,
       cwd,
@@ -628,6 +829,7 @@ handle('history:import', (cwd) => {
       workspaceRoot: workspaceFor(cwd),
       configDir: c.configDir,
       accountId: c.accountId,
+      backend: c.backend,
       imported: true,
       createdAt: Math.min(c.birth || c.t, c.t),
     });
@@ -674,8 +876,19 @@ handle('history:export', async (id) => {
   return res.filePath;
 });
 
-handle('settings:save', (patch) => {
+// An account folder as the agent sees it: ~ expanded, and in WSL a \\wsl$ or C:\ path translated.
+function agentDir(b, dir) {
+  const d = (dir || '').trim();
+  if (!d) return '';
+  if (d === '~' || /^~[\\/]/.test(d)) return b.agentPath(...d.slice(2).split(/[\\/]/).filter(Boolean));
+  return b.toAgent(d);
+}
+
+handle('settings:save', async (patch) => {
   const p = patch || {};
+  const b = backend(p.backend || settings.backend);
+  // Account folders are translated for the backend; other settings save without it.
+  if (p.agents) await b.ready();
   const agents = { ...settings.agents };
   for (const [id, a] of Object.entries(p.agents || {})) {
     if (!agents[id]) continue;
@@ -685,7 +898,7 @@ handle('settings:save', (patch) => {
       // account sent with neither keeps the key it has.
       next.accounts = a.accounts.map((x) => {
         const old = (agents[id].accounts || []).find((o) => o.id === x.id) || {};
-        const acct = { id: x.id, name: x.name, configDir: x.configDir };
+        const acct = { id: x.id, name: x.name, configDir: agentDir(b, x.configDir), uuid: x.uuid };
         if (typeof x.apiKey === 'string' && x.apiKey.trim()) acct.apiKeyEnc = encryptKey(x.apiKey.trim());
         else if (!x.clearKey && old.apiKeyEnc) acct.apiKeyEnc = old.apiKeyEnc;
         return acct;
@@ -695,22 +908,79 @@ handle('settings:save', (patch) => {
   }
   settings = normalizeSettings({ ...settings, ...p, agents, extraArgs: { ...settings.extraArgs, ...(p.extraArgs || {}) } });
   writeJson(settingsFile, settings);
-  return { settings: publicSettings(), workspace: workspace.describe(settings.workspaces), agents: agentStatus() };
+  return { settings: publicSettings(), workspace: workspace.describe(settings.workspaces), agents: await agentStatus() };
 });
 
 // What Setup needs: the current choices, folders worth suggesting, and where each
 // agent's command resolves to.
-handle('setup:info', () => {
+handle('setup:info', async () => {
   const suggested = settings.workspaces.length ? [] : workspace.suggestRoots(exeDir);
-  return { settings: publicSettings(), suggested, agents: agentStatus(), home: workspace.home() };
+  return {
+    settings: publicSettings(), suggested, agents: await agentStatus(), home: workspace.home(),
+    distros: await wslDistros(),
+  };
 });
-// Resolves typed commands without saving them: { claude: 'claude', … } -> { claude: path|null, … }.
-handle('setup:locate', (commands) => {
-  const env = buildEnv({});
-  const out = {};
-  for (const id of Object.keys(AGENTS)) out[id] = locate(id, (commands || {})[id], env);
-  return out;
+// Resolves typed commands without saving them, in the backend Setup shows:
+// { backend, commands: { claude: 'claude', … } } -> { claude: path|null, … }.
+handle('setup:locate', async ({ backend: key, commands }) => {
+  const b = backend(key);
+  const found = await locateAll(b, commands || {});
+  return { found, configDirs: { claude: b.configDir('claude'), codex: b.configDir('codex') } };
 });
+
+// ---------------------------------------------------------------------------
+// History → Agents and Live: the agents' own stores, across agents (engine.js)
+// ---------------------------------------------------------------------------
+
+const engineAgents = () => ENGINE_AGENTS.filter((t) => agentCfg(t).enabled);
+
+// A conversation from the agents' stores as a history record, so a tab can resume it:
+// the one already recorded, else a new imported one in the new-tab backend.
+function recordForNative(tool, id, cwd, title) {
+  const b = newBackend();
+  const rec = history.findByNative(tool, id);
+  if (rec) return rec;
+  const acct = activeAccount(tool);
+  return history.create({
+    agent: tool, cwd: b.toWin(cwd), nativeId: id, title: title || null, workspaceRoot: workspaceFor(b.toWin(cwd)),
+    configDir: AGENTS[tool].accountKind === 'dir' && acct ? acct.configDir || null : null, accountId: acct ? acct.id : null,
+    backend: b.key, imported: true,
+  });
+}
+
+handle('stores:list', ({ hiddenOnly } = {}) => {
+  const ownerLabels = Object.fromEntries((agentCfg('claude').accounts || []).filter((a) => a.uuid).map((a) => [a.uuid, a.name]));
+  return engineFor(newBackend()).list({ tools: engineAgents(), days: settings.agentsDays, hiddenOnly: !!hiddenOnly, ownerLabels }).then((rows) =>
+    rows.map((r) => {
+      const rec = history.findByNative(r.tool, r.id);
+      return { ...r, recordId: rec ? rec.id : null, cwdLabel: workspace.labelFor(settings.workspaces, r.winCwd) };
+    }));
+});
+handle('stores:preview', ({ tool, id }) => engineFor(newBackend()).preview(tool, id));
+handle('stores:hide', ({ keys, hidden }) => engineFor(newBackend()).setHidden(keys || [], hidden !== false));
+handle('stores:board', () => engineFor(newBackend()).board());
+
+// Opens a listed conversation in its own agent; accountId resumes a Claude one under another login.
+handle('stores:open', async ({ tool, id, cwd, title, accountId }) => {
+  const rec = recordForNative(tool, id, cwd, title);
+  if (accountId && accountId !== (accountForRecord(rec) || {}).id) await switchAccount({ recordId: rec.id, accountId });
+  return { record: publicRecord(history.get(rec.id)), settings: publicSettings() };
+});
+
+// The transfer planner. request: { sources: ['claude:<id>', ...], tool, target?, preview?, retry? }.
+handle('stores:plan', (request) => engineFor(newBackend()).plan(request));
+
+// What a tab needs to continue a planned transfer: the handoff prompt (when there is new
+// material), the conversation's title and, for a new destination, its folder. items: the source rows.
+handle('stores:handoff', ({ plan, items, cwd }) => {
+  const b = newBackend();
+  const title = plan.target ? plan.target.title : items.length > 1 ? `combined x${items.length}` : items[0].title;
+  return { title, cwd: b.toWin(cwd || items[0].cwd), prompt: plan.handoff ? engineFor(b).handoffPrompt(plan.handoff, items[0].tool, title) : null };
+});
+
+// claude-accounts.sh: links every ~/.claude-<n> to ~/.claude's history and lists the logins.
+// Setup passes the backend it shows, which may not be saved yet.
+handle('stores:claudeAccounts', ({ backend: key, create }) => engineFor(backend(key)).claudeAccounts(!!create));
 handle('setup:describe', (roots) => workspace.describe(roots || []));
 
 handle('workspace:pickFolder', async (opts) => {
@@ -734,6 +1004,10 @@ handle('workspace:refresh', () => workspace.describe(settings.workspaces));
 
 handle('state:save', (state) => writeJson(stateFile, state));
 handle('shell:openPath', (p) => shell.openPath(p));
+handle('shell:openExternal', (url) => {
+  if (!/^https?:\/\//i.test(url || '')) throw new Error(`Only web links open from the terminal: ${url}`);
+  return shell.openExternal(url);
+});
 handle('clipboard:read', () => ({ text: clipboard.readText(), hasImage: !clipboard.readImage().isEmpty() }));
 handle('clipboard:write', (text) => clipboard.writeText(text || ''));
 handle('app:devtools', () => win && win.webContents.toggleDevTools());
@@ -782,7 +1056,9 @@ function createWindow() {
   // is unreliable: on some machines it never fires, which left a windowless instance
   // holding the single-instance lock, so every later launch exited silently.
   if (state.maximized) win.maximize();
-  win.show();
+  // A smoke run must not take the keyboard from whatever is being used.
+  if (SMOKE_SHOT) win.showInactive();
+  else win.show();
   if (SMOKE_SHOT) {
     win.webContents.on('console-message', (_e, level, message, line, source) => console.log(`[renderer:${level}] ${message} (${source}:${line})`));
     const delay = Number(process.env.NI_TERM_SMOKE_DELAY || 12000);
@@ -834,9 +1110,26 @@ app.on('second-instance', () => {
   }
 });
 
+// Daily snapshots of each agent's history (helpers.py backup), shortly after start.
+function backupStores() {
+  engineFor(newBackend()).backup(engineAgents())
+    .then((made) => made.length && send('app:notice', `Backed up ${made.map((f) => path.basename(f)).join(', ')}`))
+    .catch(() => {});
+}
+
+// Day-old launch scripts and engine requests a crash left behind, and pasted screenshots.
+function clearTmp() {
+  for (const f of fs.existsSync(tmpDir) ? fs.readdirSync(tmpDir) : []) {
+    const p = path.join(tmpDir, f);
+    if (Date.now() - fs.statSync(p).mtimeMs > 86400000) fs.rmSync(p, { force: true, recursive: true });
+  }
+}
+
 app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
+  clearTmp();
   createWindow();
+  setTimeout(backupStores, 15000);
 });
 
 app.on('window-all-closed', () => {

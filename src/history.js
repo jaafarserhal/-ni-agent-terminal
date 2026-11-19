@@ -187,7 +187,7 @@ class History {
     return [...map.values()].sort((a, b) => b.lastActiveAt - a.lastActiveAt);
   }
 
-  create({ agent, cwd, nativeId, title, workspaceRoot, configDir, accountId, parentId, imported, createdAt }) {
+  create({ agent, cwd, nativeId, title, workspaceRoot, configDir, accountId, backend, parentId, imported, createdAt }) {
     const now = Date.now();
     const rec = {
       id: crypto.randomUUID(),
@@ -195,8 +195,10 @@ class History {
       cwd,
       folder: folderKey(cwd),
       workspaceRoot: workspaceRoot || null,
-      // Agent config folder (CLAUDE_CONFIG_DIR / CODEX_HOME) when not the default one.
+      // Agent config folder (CLAUDE_CONFIG_DIR / CODEX_HOME, the agent's own path) when not the default one.
       configDir: configDir || null,
+      // Where the agent runs: 'windows' or 'wsl:<distro>' (backend.js).
+      backend: backend || 'windows',
       // The Setup account the conversation runs under (see settings.agents[agent].accounts).
       accountId: accountId || null,
       nativeId: nativeId || null,
