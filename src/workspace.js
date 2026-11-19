@@ -54,19 +54,18 @@ function children(dir) {
   }
 }
 
-// Git repositories up to two levels below `root`; a repository is not searched further.
-function findRepos(root) {
+// Git repositories up to two levels below `root` ('repo'), and the folders in between that
+// hold some ('folder'), which are worked in as well; a repository is not searched further.
+function findDirs(root) {
   const out = [];
   for (const child of children(root)) {
     if (out.length >= MAX_REPOS) break;
     if (isGitRepo(child)) {
-      out.push(child);
+      out.push({ path: child, kind: 'repo' });
       continue;
     }
-    for (const grand of children(child)) {
-      if (out.length >= MAX_REPOS) break;
-      if (isGitRepo(grand)) out.push(grand);
-    }
+    const repos = children(child).filter(isGitRepo);
+    if (repos.length) out.push({ path: child, kind: 'folder' }, ...repos.map((r) => ({ path: r, kind: 'repo' })));
   }
   return out;
 }
@@ -75,16 +74,16 @@ function findRepos(root) {
 function describe(roots) {
   const list = (roots || []).filter(Boolean);
   const dirs = [];
-  const seen = new Set();
-  for (const root of list) {
-    if (!isDir(root) || seen.has(norm(root))) continue;
-    seen.add(norm(root));
+  // A workspace folder is listed as itself, with what it holds, even inside another one.
+  const found = list.filter((r, i) => isDir(r) && list.findIndex((o) => norm(o) === norm(r)) === i);
+  const seen = new Set(found.map(norm));
+  for (const root of found) {
     dirs.push({ path: root, name: path.basename(root) || root, kind: 'root', root, branch: readBranch(root) });
-    const repos = findRepos(root)
-      .filter((r) => !seen.has(norm(r)))
-      .map((r) => {
-        seen.add(norm(r));
-        return { path: r, name: labelFor([root], r), kind: 'repo', root, branch: readBranch(r) };
+    const repos = findDirs(root)
+      .filter((d) => !seen.has(norm(d.path)))
+      .map((d) => {
+        seen.add(norm(d.path));
+        return { path: d.path, name: labelFor([root], d.path), kind: d.kind, root, branch: readBranch(d.path) };
       })
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
     dirs.push(...repos);

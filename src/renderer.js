@@ -916,7 +916,7 @@ function fillCwdSelect(select, selected) {
     for (const rootDir of ws.dirs.filter((d) => d.kind === 'root')) {
       const group = el('optgroup', { label: rootDir.path });
       group.append(el('option', { value: rootDir.path }, `${rootDir.name} (workspace)${branch(rootDir)}`));
-      for (const d of ws.dirs.filter((x) => x.kind === 'repo' && x.root === rootDir.root)) {
+      for (const d of ws.dirs.filter((x) => x.kind !== 'root' && x.root === rootDir.root)) {
         group.append(el('option', { value: d.path }, `${d.name}${branch(d)}`));
       }
       select.append(group);

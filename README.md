@@ -11,7 +11,7 @@ A Windows multi-tab terminal for **Claude Code**, **Codex**, **Cursor Agent** an
 
 On first start a Setup screen asks for:
 
-- **Workspace folders**: any number of folders (a monorepo, a folder of checkouts, a single project…). New tabs open in the first one. Every Git repository inside them, up to two levels down (`<folder>/<repo>` or `<folder>/repos/<repo>`), is listed with its current branch in the new-tab folder picker and in History's *Folder* view.
+- **Workspace folders**: any number of folders (a monorepo, a folder of checkouts, a single project…). New tabs open in the first one. Every Git repository inside them, up to two levels down (`<folder>/<repo>` or `<folder>/repos/<repo>`), is listed with its current branch in the new-tab folder picker and in History's *Folder* view, and so is a folder in between that holds repositories (`<folder>/repos`).
 - **Agents**, each of them:
   - **On / off**: switched-off agents are hidden from menus and shortcuts.
   - **Command**: a name on `PATH` (default `claude`, `codex`, `cursor-agent`, `powershell.exe`) or a full path to an `.exe` / `.cmd`. Setup shows where each resolves. `%APPDATA%
