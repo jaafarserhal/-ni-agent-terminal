@@ -98,9 +98,9 @@ class Engine {
   }
 
   // Conversations newest first: { key, id, cwd (the agent's), winCwd, tool, title, members,
-  // updated, via, accounts }. ownerLabels: Claude account uuid -> name.
-  async list({ tools, days, hiddenOnly = false, ownerLabels = {} }) {
-    const res = await this.engine('list', { tools, days, hidden: this.hiddenKeys(), hidden_only: hiddenOnly, owner_labels: ownerLabels });
+  // updated, via, account (the uuid of the login that ran it, when its transcript says) }.
+  async list({ tools, days, hiddenOnly = false }) {
+    const res = await this.engine('list', { tools, days, hidden: this.hiddenKeys(), hidden_only: hiddenOnly });
     return res.rows.map((r) => ({ ...r, key: `${r.tool}:${r.id}`, winCwd: this.b.toWin(r.cwd) }));
   }
 

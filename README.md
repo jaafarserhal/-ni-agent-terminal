@@ -16,7 +16,7 @@ On first start a Setup screen asks for:
   - **On / off**: switched-off agents are hidden from menus and shortcuts.
   - **Command**: a name on `PATH` (default `claude`, `codex`, `cursor-agent`, `powershell.exe`) or a full path to an `.exe` / `.cmd`. Setup shows where each resolves. `%APPDATA%
 pm`, `%LOCALAPPDATA%cursor-agent` and `~/.local/bin` are searched as well.
-  - **Accounts**: one or more logins per agent, e.g. *Personal* and *Work*. The selected one is used by new tabs. See [Accounts](#accounts).
+  - **Accounts**: one or more logins per agent, e.g. *Personal* and *Work*. A new chat asks which one to use. See [Accounts](#accounts).
 
 Change all of this later in **Settings → Workspaces & agents**, or click *workspace* in the status bar. If you upgrade from 1.1, the old `ni-agentic-development` folder is carried over as the first workspace folder, and Setup is shown once.
 
@@ -58,11 +58,11 @@ Each of Claude, Codex and Cursor can have several accounts (Setup → *Accounts*
 - **Claude, Codex**: each account is a config folder, passed as `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, with its own login and conversation store. An empty folder is your normal login. *Add account* proposes `~/.claude-2` / `~/.codex-2`; sign in once in a tab of that account.
 - **Cursor**: Cursor Agent has a single config folder, so each account is an API key (`CURSOR_API_KEY`, from the Cursor dashboard → Integrations). An account with no key is your normal login. Keys are encrypted for your Windows user (DPAPI) and never shown again.
 
-Once an agent has more than one account, its tabs show the account name, and the new-tab menu has an account picker.
+Once an agent has more than one account, its tabs show the account name, and a new chat asks which account to use. Resuming a conversation never asks: it runs under the account it last ran with.
 
-**Switching a tab's account** (Ctrl+Shift+A cycles; or click the account in the status bar; or the tab's right-click menu): the agent is stopped, the conversation is copied into the other account's store (nothing to copy when the accounts are linked, see [Agents view and WSL](#agents-view-and-wsl)), and it resumes there. Use it to carry on in the same conversation after one account hits its usage limit. The account you switch to also becomes the one new tabs use.
+**Switching a tab's account** (Ctrl+Shift+A cycles; or click the account in the status bar; or the tab's right-click menu): the agent is stopped, the conversation is copied into the other account's store (nothing to copy when the accounts are linked, see [Agents view and WSL](#agents-view-and-wsl)), and it resumes there. Use it to carry on in the same conversation after one account hits its usage limit.
 
-Each history record remembers its account, so resuming it and following its `/clear` / `/new` keep using the right store. A 1.2 *Account folder* is carried over as a second account, still selected.
+Each history record remembers its account, so resuming it and following its `/clear` / `/new` keep using the right store. A 1.2 *Account folder* is carried over as a second account.
 
 ## Agents view and WSL
 
@@ -71,7 +71,7 @@ Each history record remembers its account, so resuming it and following its `/cl
 Claude and Codex tabs keep their output in the terminal's own buffer (Claude's classic TUI through `--settings`, Codex's `-c tui.fullscreen_transcript=false`), for that launch only: scrollback, find, mouse selection and transcripts work whatever their full-screen settings are.
 
 With **Python 3** (with SQLite) in the backend:
-- *History → Agents*: every Claude, Codex and OpenCode conversation in the agents' own stores from the last 40 days (Settings): conversations joined by a handoff are one row, under the agent used last. Click previews the last turns, double-click resumes it in a tab. Right-click: open under another Claude account, *Continue in* another agent (a handoff file with only the messages and tool notes it has not seen, kept in `handoffs\`), hide or show again (*Hidden*). Ctrl+click marks rows; *Combine into…* hands them all to one agent.
+- *History → All* lists every conversation once: this app's own, and every Claude, Codex and OpenCode conversation in the agents' own stores from the last 40 days (Settings), wherever it was started. Conversations joined by a handoff are one entry, under the agent used last. Click previews the last turns; double-click resumes it in that agent, under the account it last ran with. Right-click: open under another Claude account, *Continue in* another agent (a handoff file with only the messages and tool notes it has not seen, kept in `handoffs\`), the saved transcript, hide or show again (*Hidden*). Ctrl+click marks entries; *Combine into…* hands them all to one agent. Without Python, All lists this app's own conversations only.
 - *Live* (title bar): a board of running sessions, in or outside the app, with their state, model, last action, subagents and (WSL) shells. A Claude tab's dot pulses while Claude is working.
 - *Link accounts* (Setup → Claude): every `~/.claude-<n>` login shares `~/.claude`'s history, keeping its own login, and conversations are labelled with their login. *New linked account* creates the next one. On Windows this needs Git for Windows and Developer Mode (symlinks).
 - Each agent's history is snapshotted once a day into `backups\<tool>` (the newest ten kept).

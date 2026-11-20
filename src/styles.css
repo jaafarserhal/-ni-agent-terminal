@@ -323,14 +323,11 @@ select:focus, input:focus, textarea:focus { border-color: var(--accent); }
 }
 
 /* ---------- accounts ---------- */
-#new-menu.with-accounts { width: 430px; }
-.agent-row .acct-select { flex: none; width: 110px; padding: 3px 6px; font-size: 12px; }
 .st-account { color: var(--text); flex: none; }
 .acct-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
 .acct-row { display: flex; align-items: center; gap: 6px; }
 .modal-card .acct-row input.acct-name { width: 130px; flex: none; }
 .modal-card .acct-row input.grow { width: auto; }
-.acct-row input[type="radio"] { width: auto; margin: 0 2px; accent-color: var(--c); flex: none; }
 
 /* Claude says it is working: the tab's dot pulses. */
 .tab.working .busy { opacity: 1; animation: pulse 1.2s ease-in-out infinite; }

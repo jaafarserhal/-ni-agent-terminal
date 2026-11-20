@@ -77,13 +77,6 @@ function accountsOf(agent) {
   return (a && a.accounts) || [];
 }
 
-// The account new tabs of this agent use.
-function activeAccountOf(agent) {
-  const a = state.settings && state.settings.agents && state.settings.agents[agent];
-  const list = accountsOf(agent);
-  return list.find((x) => x.id === (a && a.activeAccount)) || list[0] || null;
-}
-
 // Accounts are only shown once an agent has more than one.
 function multiAccount(agent) {
   return accountsOf(agent).length > 1;
@@ -96,7 +89,7 @@ function tabAccount(tab) {
   const found = list.find((x) => x.id === id);
   if (found) return found;
   if (tab.record && tab.record.accountName) return { id: null, name: tab.record.accountName };
-  return activeAccountOf(tab.agent);
+  return list[0] || null;
 }
 
 function recordTitle(rec) {
@@ -247,6 +240,14 @@ function activeTab() {
 }
 
 // prompt: a first message the agent is launched with (a handoff), sent on the first start only.
+// A new chat: asks which account to use when the agent has several.
+async function newTab(opts) {
+  if (!multiAccount(opts.agent)) return createTab(opts);
+  const accountId = await chooseModal(`New ${agentLabel(opts.agent)} chat: which account?`, null,
+    accountsOf(opts.agent).map((a) => ({ label: a.name, sub: a.configDir || (a.hasKey ? 'API key' : 'Normal login'), value: a.id })));
+  return accountId ? createTab({ ...opts, accountId }) : null;
+}
+
 // live: the tab's id from before a window reload, whose agent is still running.
 function createTab({ agent, cwd, record, mode, chain, accountId, prompt, live, activate = true }) {
   const id = live || `t${state.nextTabId++}`;
@@ -553,7 +554,7 @@ function tabMenu(tab, x, y) {
   showContextMenu(x, y, [
     { label: 'Rename…', run: () => renameRecord(tab.record, tab) },
     { label: tab.running ? 'Restart (resume)' : 'Resume', run: async () => { if (tab.running) await ipc.kill(tab.id); tab.running = false; restartTab(tab); } },
-    { label: `New ${agentLabel(tab.agent)} here`, run: () => createTab({ agent: tab.agent, cwd: tab.cwd }) },
+    { label: `New ${agentLabel(tab.agent)} here`, run: () => newTab({ agent: tab.agent, cwd: tab.cwd }) },
     { label: 'Duplicate folder in…', run: () => openNewMenu(tab.cwd) },
     ...accountMenuItems(tab),
     '-',
@@ -597,7 +598,8 @@ async function switchTabAccount(tab, accountId) {
   if (!tab.record) {
     // Not started yet: it simply starts under that account.
     tab.accountId = acct.id;
-    applySaved(await ipc.saveSettings({ agents: { [tab.agent]: { activeAccount: acct.id } } }));
+    renderTabs();
+    renderStatus();
     saveState();
     return toast(label);
   }
@@ -608,7 +610,6 @@ async function switchTabAccount(tab, accountId) {
   } catch (err) {
     return toast(err.message);
   }
-  state.settings = res.settings;
   tab.record = res.record;
   tab.accountId = acct.id;
   tab.running = false;
@@ -869,7 +870,7 @@ document.addEventListener('keydown', (e) => {
     const agent = AGENT_KEYS[Number(e.code.slice(5)) - 1];
     if (!enabledAgents().includes(agent)) return toast(`${agentLabel(agent)} is switched off (Settings → Workspaces & agents)`);
     const cur = activeTab();
-    return createTab({ agent, cwd: cur ? cur.cwd : defaultCwd() });
+    return newTab({ agent, cwd: cur ? cur.cwd : defaultCwd() });
   }
   if (e.shiftKey && k === 't') return openNewMenu();
   if (e.shiftKey && k === 'w') return state.activeId && closeTab(state.activeId);
@@ -975,20 +976,9 @@ function openNewMenu(cwd) {
   enabledAgents().forEach((agent) => {
     const i = AGENT_KEYS.indexOf(agent);
     const info = state.agents[agent] || { available: false, label: agent };
-    let acctSelect = null;
-    if (multiAccount(agent)) {
-      const cur = activeAccountOf(agent);
-      acctSelect = el('select', { class: 'acct-select', title: 'Account' },
-        ...accountsOf(agent).map((a) => el('option', { value: a.id, selected: a.id === cur.id }, a.name)));
-    }
-    const go = async (mode) => {
+    const go = (mode) => {
       closePopovers();
-      const accountId = acctSelect ? acctSelect.value : null;
-      // The account picked here becomes the one Ctrl+Shift+1…5 use as well.
-      if (accountId && accountId !== activeAccountOf(agent).id) {
-        applySaved(await ipc.saveSettings({ agents: { [agent]: { activeAccount: accountId } } }));
-      }
-      createTab({ agent, cwd: $('#new-cwd').value || null, mode, accountId });
+      newTab({ agent, cwd: $('#new-cwd').value || null, mode });
     };
     list.append(
       el(
@@ -1001,7 +991,6 @@ function openNewMenu(cwd) {
           el('b', {}, info.label),
           el('small', {}, info.available ? `New session · Ctrl+Shift+${i + 1}` : 'Not found · set its path in Setup')
         ),
-        acctSelect,
         agent !== 'shell'
           ? el(
               'div',
@@ -1013,7 +1002,6 @@ function openNewMenu(cwd) {
       )
     );
   });
-  menu.classList.toggle('with-accounts', enabledAgents().some(multiAccount));
   menu.classList.remove('hidden');
   const btn = $('#btn-new').getBoundingClientRect();
   menu.style.left = Math.max(8, Math.min(btn.left, window.innerWidth - menu.offsetWidth - 10)) + 'px';
@@ -1070,49 +1058,47 @@ async function renderHistory() {
   $('#history-filter').classList.toggle('hidden', scope === 'tab');
   $('#history-tabhead').classList.toggle('hidden', scope !== 'tab');
   $('#history-folder-row').classList.toggle('hidden', scope !== 'folder');
-  $('#history-agents-row').classList.toggle('hidden', scope !== 'agents');
+  $('#history-agents-row').classList.toggle('hidden', scope !== 'all');
   $('#history-search').placeholder =
     scope === 'tab' ? 'Search prompts in this tab' : scope === 'folder' ? 'Search sessions in this folder' : 'Search title, folder or id';
   if (scope === 'tab') return renderTabPrompts(token);
-  // Only agents that are switched on, and in the Agents view only those the engine reads.
-  const offered = (agent) => agent === 'all' || (enabledAgents().includes(agent) && (scope !== 'agents' || ENGINE_AGENTS.includes(agent)));
+  // Only agents that are switched on.
+  const offered = (agent) => agent === 'all' || enabledAgents().includes(agent);
   if (!offered(state.historyAgent)) state.historyAgent = 'all';
   for (const b of document.querySelectorAll('#history-filter button')) {
     b.classList.toggle('on', b.dataset.agent === state.historyAgent);
     b.classList.toggle('hidden', !offered(b.dataset.agent));
   }
-  if (scope === 'agents') return renderAgents(token);
 
   const cwd = scope === 'folder' ? historyFolderCwd() : null;
   if (scope === 'folder') renderFolderRow(token, cwd);
-  let recs = await ipc.historyList({ agent: state.historyAgent, cwd });
+  const data = scope === 'all' ? await allShown(token) : { rows: [], records: await ipc.historyList({ cwd }) };
   if (token !== historyRender) return;
   const q = state.historyQuery.trim().toLowerCase();
-  if (q) {
-    recs = recs.filter((r) =>
-      [recordTitle(r), r.cwd, r.cwdLabel, r.nativeId, r.branch].some((v) => v && String(v).toLowerCase().includes(q))
-    );
-  }
+  const shown = (agent, texts) =>
+    (state.historyAgent === 'all' || agent === state.historyAgent) && (!q || texts.some((v) => v && String(v).toLowerCase().includes(q)));
+  const entries = [
+    ...data.rows.filter((r) => shown(r.tool, [r.title, r.record && r.record.customTitle, r.cwd, r.cwdLabel, r.id]))
+      .map((r) => ({ at: r.updated * 1000, node: agentItem(r) })),
+    ...data.records.filter((r) => shown(r.agent, [recordTitle(r), r.cwd, r.cwdLabel, r.nativeId, r.branch]))
+      .map((r) => ({ at: r.lastActiveAt, node: historyItem(r, { hideFolder: scope === 'folder' }) })),
+  ].sort((a, b) => b.at - a.at);
   const list = $('#history-list');
   list.replaceChildren();
-  if (!recs.length) {
+  if (data.note) list.append(el('div', { class: 'h-empty' }, data.note));
+  if (!entries.length) {
     const msg = q
       ? 'No matching sessions.'
       : scope === 'folder'
         ? 'No sessions in this folder yet. Every conversation started here is recorded.'
-        : 'No sessions yet. Every tab you open is recorded here.';
+        : state.agentsHidden ? 'No hidden conversations.' : 'No sessions yet. Every tab you open is recorded here.';
     list.append(el('div', { class: 'h-empty' }, msg));
     return;
   }
-  const groups = new Map();
-  for (const r of recs) {
-    const key = dayKey(r.lastActiveAt);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(r);
-  }
-  for (const [key, items] of groups) {
-    list.append(el('div', { class: 'h-group' }, key));
-    for (const r of items) list.append(historyItem(r, { hideFolder: scope === 'folder' }));
+  let group = null;
+  for (const e of entries) {
+    if (dayKey(e.at) !== group) list.append(el('div', { class: 'h-group' }, (group = dayKey(e.at))));
+    list.append(e.node);
   }
 }
 
@@ -1436,55 +1422,48 @@ $('#history-search').addEventListener('input', (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Agents view: the agents' own stores, through the engine (engine.js)
+// All view: every conversation once (history:all)
 // ---------------------------------------------------------------------------
-// One row per conversation across Claude, Codex and OpenCode: sessions joined by a
-// handoff are one row, under the agent used last.
-// Open resumes a row in its own agent; Continue in… hands it to another agent through the
-// handoff ledger; Ctrl+click marks rows to combine into one conversation.
+// The agents' own stores give the rows: one per conversation across Claude, Codex and
+// OpenCode, where sessions joined by a handoff are one row under the agent used last. The
+// history records they do not cover (Shell, Cursor, older ones) are listed with them.
+// A row opens in its latest agent under the account it last ran with; Continue in… hands it
+// to another agent through the handoff ledger; Ctrl+click marks rows to combine into one.
 
-let agentsCache = { at: 0, hidden: false, rows: null, error: null };
-let agentsLoading = null;
+let allCache = { at: 0, hidden: false, data: null };
+let allLoading = null;
 
-function agentRows(force) {
-  const fresh = agentsCache.rows && agentsCache.hidden === state.agentsHidden && Date.now() - agentsCache.at < 20000;
-  if (fresh && !force) return Promise.resolve(agentsCache);
-  if (!agentsLoading) {
+function loadAll(force) {
+  const fresh = allCache.data && allCache.hidden === state.agentsHidden && Date.now() - allCache.at < 20000;
+  if (fresh && !force) return Promise.resolve(allCache.data);
+  if (!allLoading) {
     const hidden = state.agentsHidden;
-    agentsLoading = ipc.storesList(hidden)
-      .then((rows) => ({ rows, error: null }), (err) => ({ rows: [], error: err.message }))
-      .then((r) => {
-        agentsCache = { at: Date.now(), hidden, ...r };
-        agentsLoading = null;
-        return agentsCache;
+    allLoading = ipc.historyAll(hidden)
+      .then((data) => ({ ...data, note: data.error }), (err) => ({ rows: [], records: null, note: err.message }))
+      .then((data) => {
+        allCache = { at: Date.now(), hidden, data };
+        allLoading = null;
+        return data;
       });
   }
-  return agentsLoading;
+  return allLoading;
 }
 
-function invalidateAgents() {
-  agentsCache.at = 0;
+function invalidateAll() {
+  allCache.at = 0;
+}
+
+// What the All view shows now: the last listing, refreshed behind it; before the first one
+// arrives (it parses every transcript once), this app's own records.
+async function allShown(token) {
+  renderAgentsBar();
+  const have = allCache.data && allCache.hidden === state.agentsHidden ? allCache.data : null;
+  loadAll(false).then((data) => data !== have && token === historyRender && renderHistory());
+  const data = have || { rows: [], records: null, note: 'Reading the agents\' stores…' };
+  return data.records ? data : { ...data, records: state.agentsHidden ? [] : await ipc.historyList({}) };
 }
 
 const agentTabOf = (r) => state.tabs.find((t) => t.agent === r.tool && t.record && t.record.nativeId === r.id);
-
-async function renderAgents(token) {
-  const list = $('#history-list');
-  if (!agentsCache.rows || agentsCache.hidden !== state.agentsHidden) list.replaceChildren(el('div', { class: 'h-empty' }, 'Reading the agents\' stores…'));
-  renderAgentsBar();
-  const { rows, error } = await agentRows(false);
-  if (token !== historyRender) return;
-  const q = state.historyQuery.trim().toLowerCase();
-  const shown = rows.filter((r) =>
-    (state.historyAgent === 'all' || r.tool === state.historyAgent) &&
-    (!q || [r.title, r.cwd, r.cwdLabel, r.id, r.tool].some((v) => v && v.toLowerCase().includes(q))));
-  list.replaceChildren();
-  if (error) return list.append(el('div', { class: 'h-empty' }, error));
-  if (!shown.length) {
-    return list.append(el('div', { class: 'h-empty' }, q ? 'No matching conversations.' : state.agentsHidden ? 'No hidden conversations.' : 'No conversations in the agents\' stores yet.'));
-  }
-  for (const r of shown) list.append(agentItem(r));
-}
 
 function renderAgentsBar() {
   const n = state.agentsMarked.size;
@@ -1508,7 +1487,7 @@ function agentItem(r) {
     agentLabel(r.tool),
     r.cwdLabel,
     r.via.length ? `via ${r.via.map(agentLabel).join(', ')}` : null,
-    r.accounts.length ? r.accounts.join(' › ') : null,
+    multiAccount(r.tool) ? (accountsOf(r.tool).find((a) => a.id === r.accountId) || {}).name : null,
     `…${r.id.slice(-6)}`,
   ].filter(Boolean);
   return el(
@@ -1530,7 +1509,7 @@ function agentItem(r) {
       },
     },
     el('span', { class: 'dot' }),
-    el('span', { class: 't' }, r.title),
+    el('span', { class: 't' }, (r.record && r.record.customTitle) || r.title),
     el(
       'span',
       { class: 'acts' },
@@ -1546,28 +1525,26 @@ function toggleMark(r) {
   renderHistory();
 }
 
-// Destinations: the row's own agent, then the others;
-// Claude once per account when there are several.
-function agentTargets(ownTool) {
-  const tools = [ownTool, ...ENGINE_AGENTS.filter((t) => t !== ownTool && enabledAgents().includes(t))].filter(Boolean);
-  return tools.flatMap((tool) =>
-    tool === 'claude' && multiAccount('claude')
-      ? [activeAccountOf('claude'), ...accountsOf('claude').filter((a) => a.id !== activeAccountOf('claude').id)].map((a) => ({ tool, accountId: a.id, label: `Claude · ${a.name}` }))
-      : [{ tool, accountId: null, label: agentLabel(tool) }]);
-}
+// Other agents a conversation can be continued in.
+const otherAgents = (tool) => ENGINE_AGENTS.filter((t) => t !== tool && enabledAgents().includes(t));
 
 function agentMenu(r, x, y) {
-  const targets = agentTargets(r.tool);
+  const rec = r.record;
   showContextMenu(x, y, [
-    ...targets.filter((t) => t.tool === r.tool).map((t, i) => ({
-      label: `Open in ${t.label}`,
-      hint: i === 0 ? 'double-click' : 'same conversation',
-      run: () => openRow(r, t.accountId),
-    })),
-    ...(targets.some((t) => t.tool !== r.tool) ? ['-'] : []),
-    ...targets.filter((t) => t.tool !== r.tool).map((t) => ({ label: `Continue in ${t.label}…`, hint: 'handoff', run: () => transfer([r], t.tool, t.accountId) })),
+    { label: `Open in ${agentLabel(r.tool)}`, hint: 'double-click', run: () => openRow(r) },
+    // Carrying on under another login, e.g. once this one hits its usage limit.
+    ...(r.tool === 'claude' ? accountsOf('claude').filter((a) => a.id !== r.accountId) : [])
+      .map((a) => ({ label: `Open under ${a.name}`, hint: 'same conversation', run: () => openRow(r, a.id) })),
+    ...otherAgents(r.tool).map((t) => ({ label: `Continue in ${agentLabel(t)}…`, hint: 'handoff', run: () => transfer([r], t) })),
     '-',
     { label: 'Preview', run: () => openAgentPreview(r) },
+    ...(rec ? [
+      { label: 'Saved transcript', run: () => openViewer(rec.id) },
+      { label: 'Rename…', run: () => renameRecord(rec) },
+      { label: 'Export as text…', run: () => ipc.historyExport(rec.id) },
+      { label: 'Delete from history', run: () => deleteRecord(rec) },
+    ] : []),
+    '-',
     { label: state.agentsMarked.has(r.key) ? 'Unmark' : 'Mark to combine', hint: 'Ctrl+click', run: () => toggleMark(r) },
     { label: state.agentsHidden ? 'Show in the list again' : 'Hide', run: () => hideRows([r], !state.agentsHidden) },
     { label: 'Copy session id', run: () => { ipc.clipboardWrite(r.id); toast('Copied'); } },
@@ -1575,15 +1552,15 @@ function agentMenu(r, x, y) {
 }
 
 function combineMenu(x, y) {
-  const items = agentsCache.rows.filter((r) => state.agentsMarked.has(r.key));
+  const items = allCache.data.rows.filter((r) => state.agentsMarked.has(r.key));
   if (items.length < 2) return toast('Mark at least two conversations to combine');
-  showContextMenu(x, y, agentTargets(null).map((t) => ({ label: `Combine into ${t.label}…`, run: () => transfer(items, t.tool, t.accountId) })));
+  showContextMenu(x, y, otherAgents(null).map((t) => ({ label: `Combine into ${agentLabel(t)}…`, run: () => transfer(items, t) })));
 }
 
 async function hideRows(rows, hidden) {
   await ipc.storesHide(rows.flatMap((r) => r.members), hidden);
   for (const r of rows) state.agentsMarked.delete(r.key);
-  invalidateAgents();
+  invalidateAll();
   toast(hidden ? 'Hidden' : 'Shown again');
   renderHistory();
 }
@@ -1606,10 +1583,10 @@ async function openAgentPreview(r) {
   }
 }
 
-// Resumes a conversation of the agents' stores (r: { tool, id, cwd, title }) in its own agent:
-// a Claude one under `accountId`, else (double-click, ▶) under the account new tabs use, as
-// the menu's first entry says. `prompt` (a handoff) is sent to it. A tab already on it is
-// used as it is; without a prompt, naming another account switches that tab.
+// Resumes a conversation of the agents' stores (r: { tool, id, cwd, title, accountId }) in
+// its own agent, under the account it last ran with (r.accountId); naming another account
+// carries it on under that login. `prompt` (a handoff) is sent to it. A tab already on it is
+// used as it is, unless another account is named.
 async function openNative(r, accountId, prompt) {
   const open = agentTabOf(r);
   if (open) {
@@ -1622,11 +1599,9 @@ async function openNative(r, accountId, prompt) {
     }
     return;
   }
-  if (!accountId && r.tool === 'claude' && multiAccount('claude')) accountId = activeAccountOf('claude').id;
-  const res = await ipc.storesOpen({ tool: r.tool, id: r.id, cwd: r.cwd, title: r.title, accountId });
-  state.settings = res.settings;
-  invalidateAgents();
-  createTab({ agent: r.tool, cwd: res.record.cwd, record: res.record, mode: 'resume', prompt });
+  const record = await ipc.storesOpen({ tool: r.tool, id: r.id, cwd: r.cwd, title: r.title, accountId: accountId || r.accountId });
+  invalidateAll();
+  createTab({ agent: r.tool, cwd: record.cwd, record, mode: 'resume', prompt });
 }
 
 const openRow = (r, accountId) => openNative(r, accountId).catch((err) => toast(err.message));
@@ -1648,7 +1623,7 @@ function chooseModal(title, intro, options) {
 // Hands conversations to `tool` through the transfer planner: only the
 // messages and tool notes the destination has not seen go into a handoff file, which the
 // destination is told to read. An existing linked destination is resumed rather than a new one started.
-async function transfer(items, tool, accountId) {
+async function transfer(items, tool) {
   const req = { sources: items.map((r) => r.key), tool, preview: true };
   let plan;
   let cwd = null;
@@ -1682,10 +1657,11 @@ async function transfer(items, tool, accountId) {
     if (plan.status !== 'ready') throw new Error(`Unexpected synchronization status: ${plan.status}`);
     const h = await ipc.storesHandoff({ plan, items, cwd });
     state.agentsMarked.clear();
-    invalidateAgents();
+    invalidateAll();
     toast(plan.handoff ? `Continuing with ${plan.count} new messages/tool notes` : 'Already synchronized; resuming without adding a prompt');
-    if (plan.target) await openNative({ tool, id: plan.target.id, cwd: plan.target.cwd, title: h.title }, accountId, h.prompt);
-    else createTab({ agent: tool, cwd: h.cwd, mode: 'new', prompt: h.prompt, accountId });
+    // An existing destination resumes under its own last account; a new one is a new chat.
+    if (plan.target) await openNative({ tool, id: plan.target.id, cwd: plan.target.cwd, title: h.title }, null, h.prompt);
+    else await newTab({ agent: tool, cwd: h.cwd, mode: 'new', prompt: h.prompt });
   } catch (err) {
     toast(`Conversation transfer stopped: ${err.message}`);
   }
@@ -1697,7 +1673,7 @@ $('#history-agents-hidden').onclick = () => {
   renderHistory();
 };
 $('#history-agents-reload').onclick = async () => {
-  await agentRows(true);
+  await loadAll(true);
   renderHistory();
 };
 
@@ -1983,7 +1959,7 @@ function openSettings() {
           extraArgs: Object.fromEntries(AGENT_KEYS.map((a) => [a, extra[a].value.trim()])),
         };
         applySaved(await ipc.saveSettings(patch));
-        invalidateAgents();
+        invalidateAll();
         setFontSize(state.settings.fontSize);
       },
     },
@@ -2011,19 +1987,16 @@ const AGENT_HINTS = {
 };
 
 // The accounts of one agent in Setup. Claude / Codex: a name and a config folder each;
-// Cursor: a name and an API key. The radio button picks the account new tabs use.
+// Cursor: a name and an API key.
 function accountEditor(agent, st, cfg) {
   const isDir = st.accountKind === 'dir';
   const list = (cfg.accounts && cfg.accounts.length ? cfg.accounts : [{ id: 'default', name: 'Default', configDir: '' }])
-    .map((x) => ({ id: x.id, name: x.name, configDir: x.configDir || '', uuid: x.uuid || '', hasKey: !!x.hasKey, apiKey: '', clearKey: false }));
-  let active = list.some((x) => x.id === cfg.activeAccount) ? cfg.activeAccount : list[0].id;
+    .map((x) => ({ id: x.id, name: x.name, configDir: x.configDir || '', hasKey: !!x.hasKey, apiKey: '', clearKey: false }));
   const wrap = el('div', { class: 'acct-list' });
   const newId = () => `acct-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
   const render = () => {
     wrap.replaceChildren(...list.map((x, i) => {
-      const radio = el('input', { type: 'radio', name: `acct-${agent}`, title: 'New tabs use this account', checked: x.id === active });
-      radio.addEventListener('change', () => { active = x.id; });
       const name = el('input', { class: 'acct-name', value: x.name, placeholder: `Account ${i + 1}`, spellcheck: 'false', title: 'Name shown on tabs and in the status bar' });
       name.addEventListener('input', () => { x.name = name.value; });
       let detail;
@@ -2055,12 +2028,11 @@ function accountEditor(agent, st, cfg) {
             title: isDir ? 'Remove this account (its folder and conversations stay on disk)' : 'Remove this account',
             onclick: () => {
               list.splice(i, 1);
-              if (active === x.id) active = list[0].id;
               render();
             },
           }, '✕')
         : null;
-      return el('div', { class: 'acct-row' }, radio, name, ...detail, remove);
+      return el('div', { class: 'acct-row' }, name, ...detail, remove);
     }));
   };
   const add = el('button', {
@@ -2074,28 +2046,27 @@ function accountEditor(agent, st, cfg) {
   render();
 
   const help = isDir
-    ? `Each account is a config folder (${st.configEnv}) with its own login. An empty folder is your normal login. Sign in once in a tab of a new account. The selected account is used by new tabs. To switch a tab, press Ctrl+Shift+A or click the account in the status bar: its conversation resumes under the other login, copied there unless the accounts share one history.${agent === 'claude' ? ' Link accounts shares ~/.claude\'s history with every ~/.claude-<n> login.' : ''}`
-    : `Each account is a Cursor API key (${st.keyEnv}, from the Cursor dashboard → Integrations). An account with no key is your normal login. Keys are stored encrypted for your Windows user. The selected account is used by new tabs. To switch a tab, press Ctrl+Shift+A or click the account in the status bar.`;
+    ? `Each account is a config folder (${st.configEnv}) with its own login. An empty folder is your normal login. Sign in once in a tab of a new account. A new chat asks which account to use; a conversation resumes under the one it last ran with. To switch a tab, press Ctrl+Shift+A or click the account in the status bar: its conversation resumes under the other login, copied there unless the accounts share one history.${agent === 'claude' ? ' Link accounts shares ~/.claude\'s history with every ~/.claude-<n> login.' : ''}`
+    : `Each account is a Cursor API key (${st.keyEnv}, from the Cursor dashboard → Integrations). An account with no key is your normal login. Keys are stored encrypted for your Windows user. A new chat asks which account to use; a conversation resumes under the one it last ran with. To switch a tab, press Ctrl+Shift+A or click the account in the status bar.`;
   const node = el('div', { class: 'field' }, el('span', {}, 'Accounts'), wrap, el('div', { class: 'row' }, add), el('div', { class: 'help' }, help));
 
   const normDir = (p) => (p.trim() || st.defaultConfigDir || '').replace(/[\\/]+$/, '').toLowerCase();
   return {
     node,
     refresh: render,
-    // Accounts claude-accounts.sh reported, the first being the normal login: each takes
-    // its login's uuid (which labels its conversations), and missing ones are added.
+    // Accounts claude-accounts.sh reported, the first being the normal login: missing ones
+    // are added, and one still on its default name takes its login's.
     merge(found) {
       found.forEach((a, i) => {
         const dir = i === 0 ? '' : a.dir;
         const short = a.email ? a.email.split('@')[0] : '';
         let x = list.find((o) => normDir(o.configDir) === normDir(dir || st.defaultConfigDir || ''));
         if (!x) {
-          x = { id: newId(), name: short || dir.split(/[\\/]/).pop(), configDir: dir, uuid: '', hasKey: false, apiKey: '', clearKey: false };
+          x = { id: newId(), name: short || dir.split(/[\\/]/).pop(), configDir: dir, hasKey: false, apiKey: '', clearKey: false };
           list.push(x);
         } else if (short && /^(Default|Account \d+)$/.test(x.name)) {
           x.name = short;
         }
-        x.uuid = a.uuid || x.uuid;
       });
       render();
     },
@@ -2120,11 +2091,9 @@ function accountEditor(agent, st, cfg) {
           id: x.id,
           name: x.name.trim() || `Account ${i + 1}`,
           configDir: isDir ? x.configDir.trim() : '',
-          ...(x.uuid ? { uuid: x.uuid } : {}),
           ...(x.apiKey.trim() ? { apiKey: x.apiKey.trim() } : {}),
           ...(x.clearKey ? { clearKey: true } : {}),
         })),
-        activeAccount: active,
       };
     },
   };
@@ -2284,7 +2253,7 @@ async function openSetup({ first = false } = {}) {
     let res;
     try {
       res = await ipc.saveSettings({ setupDone: true, workspaces: roots, agents, startupTabs, backend: backendSel.value });
-      invalidateAgents();
+      invalidateAll();
     } catch (err) {
       toast(err.message);
       return false;
@@ -2471,7 +2440,7 @@ function openStartupTabs() {
 function renderEmptyActions() {
   const empty = $('#empty-actions');
   empty.replaceChildren(
-    ...enabledAgents().map((a) => el('button', { class: 'small-btn', onclick: () => createTab({ agent: a, cwd: defaultCwd() }) }, `New ${agentLabel(a)}`)),
+    ...enabledAgents().map((a) => el('button', { class: 'small-btn', onclick: () => newTab({ agent: a, cwd: defaultCwd() }) }, `New ${agentLabel(a)}`)),
     el('button', { class: 'small-btn', onclick: () => openSetup() }, 'Workspaces & agents…')
   );
 }

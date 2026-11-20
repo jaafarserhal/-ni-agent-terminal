@@ -60,7 +60,7 @@ contextBridge.exposeInMainWorld('api', {
   openPath: (p) => call('shell:openPath', p),
   openExternal: (url) => call('shell:openExternal', url),
 
-  storesList: (hiddenOnly) => call('stores:list', { hiddenOnly }),
+  historyAll: (hiddenOnly) => call('history:all', { hiddenOnly }),
   storesPreview: (tool, id) => call('stores:preview', { tool, id }),
   storesHide: (keys, hidden) => call('stores:hide', { keys, hidden }),
   storesBoard: () => call('stores:board'),

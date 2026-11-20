@@ -101,6 +101,18 @@ class TransferTests(unittest.TestCase):
 
         self.assertEqual(self.listed(), [('claude', 'interactive chat', [self.key('claude')])])
 
+    def test_history_names_the_login_that_ran_a_conversation(self):
+        folder = Path(self.request['claude_root'])
+        folder.mkdir()
+        rows = {'owned': [{'type': 'session-owner', 'accountUuid': 'creator'}],
+                # A bridge names the login that was running; later owner records still name the creator.
+                'continued': [{'type': 'session-owner', 'accountUuid': 'creator'}, {'type': 'bridge-session', 'ownerAccountUuid': 'other'},
+                              {'type': 'session-owner', 'accountUuid': 'creator'}]}
+        for sid, records in rows.items():
+            (folder / (sid + '.jsonl')).write_text(''.join(json.dumps(r) + '\n' for r in [{'type': 'user', 'cwd': str(self.root), 'message': {'content': sid}}] + records))
+        listed = {row['id']: row['account'] for row in conversations({**self.request, 'tools': ['claude'], 'days': 40})}
+        self.assertEqual({'owned': 'creator', 'continued': 'other'}, listed)
+
     def test_preview_shows_the_last_chat_turns_of_each_tool(self):
         for tool in ('codex', 'claude', 'opencode'):
             for turn in range(10):

@@ -67,7 +67,8 @@ class Session:
         self.active = True
         self.headless = False
         self.named = self.inherited = ''
-        self.owners = []
+        self.account = ''  # uuid of the login that ran it, as far as the transcript says
+        self._bridged = False
         self.updated = 0
         self._counts = collections.Counter()
 
@@ -184,11 +185,13 @@ def read_jsonl(path, tool):
                 session.title = row.get('customTitle') or row.get('aiTitle') or session.title
                 session.named = row.get('customTitle') or session.named
                 session.headless = session.headless or str(row.get('entrypoint') or '').startswith('sdk-')
-                if kind in ('session-owner', 'history-suppression'):
-                    # The owner record, or the account an owner-mismatch resume ran under; keep each account's latest use.
-                    owner = next((value for name, value in row.items() if name.lower().endswith('accountuuid') and value), None)
-                    if owner:
-                        session.owners = [o for o in session.owners if o != owner] + [owner]
+                # The login a remote-control bridge ran under is the one that was running. The
+                # owner record only ever names the login that created the session, even while
+                # another one continues it, so it is the fallback.
+                if kind == 'bridge-session' and row.get('ownerAccountUuid'):
+                    session.account, session._bridged = row['ownerAccountUuid'], True
+                elif kind == 'session-owner' and not session._bridged:
+                    session.account = row.get('accountUuid') or session.account
                 session.continued = row.get('continuedInSessionId') or session.continued
                 if kind in ('user', 'assistant'):
                     content = (row.get('message') or {}).get('content')
@@ -247,7 +250,7 @@ def read_sessions(request, db):
                 continue
             seen.add(str(path))
             stat = path.stat()
-            signature = f'6:{stat.st_mtime_ns}:{stat.st_size}'
+            signature = f'7:{stat.st_mtime_ns}:{stat.st_size}'
             cached = db.execute('SELECT signature, data FROM cache WHERE path = ?', (str(path),)).fetchone()
             if cached and cached[0] == signature:
                 session = Session(tool, '')
@@ -519,7 +522,8 @@ def conversations(request):
     conversation, shown as the member used last; the others are reached through a transfer to their tool.
 
     Row: id, cwd, tool, title, named (the CLI holds a user-given name), members (session keys),
-    updated (epoch seconds), via (the other agents it went through), accounts (owner labels).
+    updated (epoch seconds), via (the other agents it went through), account (the uuid of the
+    login that ran it, when the transcript says).
     """
     directory = Path(native_path(request['state_dir']))
     with closing(open_ledger(directory)) as db, closing(open_cache(Path(native_path(request.get('cache_db') or str(directory / 'cache.db'))))) as cache, cache:
@@ -549,7 +553,6 @@ def conversations(request):
         # Hidden sessions are listed one by one, so each can be shown again on its own.
         groups[session.key if request.get('hidden_only') else find(session.key)].append(session)
     names = native_names(request)
-    owners = request.get('owner_labels') or {}
     cutoff = 0 if request.get('hidden_only') else (time.time() - request['days'] * 86400) * 1e9
     rows = []
     for members in sorted(groups.values(), key=lambda group: -max(s.updated for s in group)):
@@ -563,7 +566,7 @@ def conversations(request):
             'title': ' '.join((named or current.named or current.inherited or current.title or 'Untitled session').split()),
             'members': [s.key for s in members], 'updated': current.updated / 1e9,
             'via': list(dict.fromkeys(s.tool for s in members[1:] if s.tool != current.tool)),
-            'accounts': [owners[o] for o in current.owners if o in owners],
+            'account': current.account,
         })
     return rows
 

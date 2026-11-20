@@ -132,12 +132,13 @@ function normalizeSettings(s) {
   return out;
 }
 
-// Accounts of one agent: [{ id, name, configDir, apiKeyEnc? }] plus the one new tabs
-// use. A Claude / Codex account is a config folder ('' = the normal login); a Cursor
-// account is an API key, kept encrypted (apiKeyEnc), with no key = the normal login.
+// Accounts of one agent: [{ id, name, configDir, apiKeyEnc? }]. A Claude / Codex account is
+// a config folder ('' = the normal login); a Cursor account is an API key, kept encrypted
+// (apiKeyEnc), with no key = the normal login. A new chat asks which one to use; a
+// conversation keeps the one it last ran under (its history record).
 function normalizeAccounts(agentId, a) {
   const kind = AGENTS[agentId].accountKind;
-  if (!kind) return { accounts: [], activeAccount: null };
+  if (!kind) return { accounts: [] };
   const seen = new Set();
   const freshId = () => `acct-${crypto.randomUUID().slice(0, 8)}`;
   let accounts = (Array.isArray(a.accounts) ? a.accounts : [])
@@ -151,23 +152,16 @@ function normalizeAccounts(agentId, a) {
         name: (typeof x.name === 'string' && x.name.trim()) || (i === 0 ? 'Default' : `Account ${i + 1}`),
         configDir: kind === 'dir' && typeof x.configDir === 'string' ? x.configDir.trim() : '',
       };
-      // The login a linked Claude account reported (claude-accounts.sh): labels its conversations.
-      if (typeof x.uuid === 'string' && x.uuid) acct.uuid = x.uuid;
       if (kind === 'key' && typeof x.apiKeyEnc === 'string' && x.apiKeyEnc) acct.apiKeyEnc = x.apiKeyEnc;
       return acct;
     });
-  let active = a.activeAccount;
   if (!accounts.length) {
     accounts = [{ id: 'default', name: 'Default', configDir: '' }];
-    // 1.2 had one account folder per agent: keep it as a second account, still in use.
+    // 1.2 had one account folder per agent: keep it as a second account.
     const legacy = kind === 'dir' && typeof a.configDir === 'string' ? a.configDir.trim() : '';
-    if (legacy) {
-      accounts.push({ id: 'account-2', name: path.basename(legacy) || 'Account 2', configDir: legacy });
-      active = 'account-2';
-    }
+    if (legacy) accounts.push({ id: 'account-2', name: path.basename(legacy) || 'Account 2', configDir: legacy });
   }
-  if (!accounts.some((x) => x.id === active)) active = accounts[0].id;
-  return { accounts, activeAccount: active };
+  return { accounts };
 }
 
 // Settings as the window sees them: API keys are never sent, only whether one is saved.
@@ -224,7 +218,7 @@ function workspaceFor(cwd) {
 }
 
 function agentCfg(id) {
-  return settings.agents[id] || { enabled: true, command: '', accounts: [], activeAccount: null };
+  return settings.agents[id] || { enabled: true, command: '', accounts: [] };
 }
 
 const sameDir = (a, b) => (!a && !b) || (!!a && !!b && samePath(a, b));
@@ -233,10 +227,9 @@ function accountById(agentId, accountId) {
   return (agentCfg(agentId).accounts || []).find((x) => x.id === accountId) || null;
 }
 
-// The account new tabs of this agent use.
-function activeAccount(agentId) {
-  const cfg = agentCfg(agentId);
-  return accountById(agentId, cfg.activeAccount) || (cfg.accounts || [])[0] || null;
+// The account used when nothing says which: the first one.
+function firstAccount(agentId) {
+  return (agentCfg(agentId).accounts || [])[0] || null;
 }
 
 // The account a conversation runs under: the one it was started with, else (records
@@ -531,7 +524,7 @@ async function startPty({ tabId, agent, cwd, recordId, mode, accountId, cols, ro
   await b.ready();
   // The account folder is kept with the record: the conversation lives in that
   // folder's store, so resuming it later must use the same one.
-  const acct = rec ? null : accountById(agent, accountId) || activeAccount(agent);
+  const acct = rec ? null : accountById(agent, accountId) || firstAccount(agent);
   const configDir = rec ? rec.configDir : (acct && acct.configDir) || null;
   const store = await storeDir(b, agent, configDir);
   // Only now, with nothing left to await: a second start of the same tab must not slip in between.
@@ -554,7 +547,7 @@ async function startPty({ tabId, agent, cwd, recordId, mode, accountId, cols, ro
     rec = history.create({ agent, cwd, nativeId, workspaceRoot: workspaceFor(cwd), configDir, accountId: acct ? acct.id : null, backend: b.key });
   }
   // Cursor's account is an API key; a record whose account was removed uses the current one.
-  const keyAcct = AGENTS[agent].accountKind === 'key' ? accountForRecord(rec) || activeAccount(agent) : null;
+  const keyAcct = AGENTS[agent].accountKind === 'key' ? accountForRecord(rec) || firstAccount(agent) : null;
   const apiKey = keyAcct ? decryptKey(keyAcct.apiKeyEnc) : null;
   if (keyAcct && keyAcct.apiKeyEnc && !apiKey) throw new Error(`The API key of ${AGENTS[agent].label} account "${keyAcct.name}" cannot be read. Enter it again in Setup.`);
   if (!fs.existsSync(cwd)) throw new Error(`Working folder no longer exists: ${cwd}`);
@@ -689,8 +682,7 @@ function stopPty(tabId) {
 
 // Moves a conversation to another account of its agent: the tab's process is stopped,
 // the conversation is copied into that account's store (Claude, Codex), and the record
-// follows the account, so the next start resumes it there. That account also becomes
-// the one new tabs of this agent use.
+// follows the account, so the next start resumes it there.
 async function switchAccount({ tabId, recordId, accountId }) {
   const s = tabId ? sessions.get(tabId) : null;
   const rec = history.get(s ? s.recordId : recordId);
@@ -712,11 +704,7 @@ async function switchAccount({ tabId, recordId, accountId }) {
     copied = !rec.nativeId || copyConversation(rec.agent, b.toAgent(rec.cwd), rec.nativeId, await storeDir(b, rec.agent, rec.configDir), to);
   }
   history.update(rec.id, { accountId: acct.id, configDir: agent.accountKind === 'dir' ? acct.configDir || null : rec.configDir });
-  if (settings.agents[rec.agent].activeAccount !== acct.id) {
-    settings.agents[rec.agent].activeAccount = acct.id;
-    writeJson(settingsFile, settings);
-  }
-  return { record: publicRecord(rec), settings: publicSettings(), copied };
+  return { record: publicRecord(rec), copied };
 }
 
 // ---------------------------------------------------------------------------
@@ -924,7 +912,7 @@ handle('settings:save', async (patch) => {
       // account sent with neither keeps the key it has.
       next.accounts = a.accounts.map((x) => {
         const old = (agents[id].accounts || []).find((o) => o.id === x.id) || {};
-        const acct = { id: x.id, name: x.name, configDir: agentDir(b, x.configDir), uuid: x.uuid };
+        const acct = { id: x.id, name: x.name, configDir: agentDir(b, x.configDir) };
         if (typeof x.apiKey === 'string' && x.apiKey.trim()) acct.apiKeyEnc = encryptKey(x.apiKey.trim());
         else if (!x.clearKey && old.apiKeyEnc) acct.apiKeyEnc = old.apiKeyEnc;
         return acct;
@@ -961,12 +949,12 @@ handle('setup:locate', async ({ backend: key, commands }) => {
 const engineAgents = () => ENGINE_AGENTS.filter((t) => agentCfg(t).enabled);
 
 // A conversation from the agents' stores as a history record, so a tab can resume it:
-// the one already recorded, else a new imported one in the new-tab backend.
-function recordForNative(tool, id, cwd, title) {
+// the one already recorded, else a new imported one in the new-tab backend under `accountId`.
+function recordForNative(tool, id, cwd, title, accountId) {
   const b = newBackend();
   const rec = history.findByNative(tool, id);
   if (rec) return rec;
-  const acct = activeAccount(tool);
+  const acct = accountById(tool, accountId) || firstAccount(tool);
   return history.create({
     agent: tool, cwd: b.toWin(cwd), nativeId: id, title: title || null, workspaceRoot: workspaceFor(b.toWin(cwd)),
     configDir: AGENTS[tool].accountKind === 'dir' && acct ? acct.configDir || null : null, accountId: acct ? acct.id : null,
@@ -974,23 +962,51 @@ function recordForNative(tool, id, cwd, title) {
   });
 }
 
-handle('stores:list', ({ hiddenOnly } = {}) => {
-  const ownerLabels = Object.fromEntries((agentCfg('claude').accounts || []).filter((a) => a.uuid).map((a) => [a.uuid, a.name]));
-  return engineFor(newBackend()).list({ tools: engineAgents(), days: settings.agentsDays, hiddenOnly: !!hiddenOnly, ownerLabels }).then((rows) =>
-    rows.map((r) => {
+// Which Claude account each login is, by its uuid: every account folder's .claude.json names
+// its login. The normal login's file sits beside its folder (~/.claude.json), unless the app
+// inherited CLAUDE_CONFIG_DIR.
+function claudeLogins(b) {
+  const logins = new Map();
+  for (const acct of agentCfg('claude').accounts || []) {
+    const inside = acct.configDir || (b.kind === 'windows' && process.env.CLAUDE_CONFIG_DIR);
+    const file = b.toWin(inside ? `${inside}/.claude.json` : `${b.configDir('claude')}.json`);
+    const uuid = (readJson(file, {}).oauthAccount || {}).accountUuid;
+    if (uuid) logins.set(uuid, acct);
+  }
+  return logins;
+}
+
+// History → All: every conversation once. The agents' stores give the rows, where a
+// conversation handed between agents is one row under the agent used last; the history
+// records they do not cover (Shell, Cursor, another backend, older ones) follow as they are.
+// A row resumes under the account its record last ran with, else the login its transcript
+// names, else the first account. Without Python only the records are listed, with the reason.
+handle('history:all', async ({ hiddenOnly } = {}) => {
+  const b = newBackend();
+  const engine = engineFor(b);
+  const res = await engine.list({ tools: engineAgents(), days: settings.agentsDays, hiddenOnly: !!hiddenOnly })
+    .then((rows) => ({ rows, logins: claudeLogins(b) }), (err) => ({ rows: [], logins: new Map(), error: err.message }));
+  const covered = new Set([...res.rows.flatMap((r) => r.members), ...engine.hiddenKeys()]);
+  return {
+    error: res.error || null,
+    rows: res.rows.map((r) => {
       const rec = history.findByNative(r.tool, r.id);
-      return { ...r, recordId: rec ? rec.id : null, cwdLabel: workspace.labelFor(settings.workspaces, r.winCwd) };
-    }));
+      const acct = (rec && accountForRecord(rec)) || res.logins.get(r.account) || firstAccount(r.tool);
+      return { ...r, record: publicRecord(rec), accountId: acct ? acct.id : null, cwdLabel: workspace.labelFor(settings.workspaces, r.winCwd) };
+    }),
+    records: hiddenOnly ? [] : history.list({}).filter((rec) => !covered.has(`${rec.agent}:${rec.nativeId}`)).map(publicRecord),
+  };
 });
 handle('stores:preview', ({ tool, id }) => engineFor(newBackend()).preview(tool, id));
 handle('stores:hide', ({ keys, hidden }) => engineFor(newBackend()).setHidden(keys || [], hidden !== false));
 handle('stores:board', () => engineFor(newBackend()).board());
 
-// Opens a listed conversation in its own agent; accountId resumes a Claude one under another login.
+// A listed conversation as a record to resume, under `accountId`: its own account by
+// default, another one to carry on under that login.
 handle('stores:open', async ({ tool, id, cwd, title, accountId }) => {
-  const rec = recordForNative(tool, id, cwd, title);
+  const rec = recordForNative(tool, id, cwd, title, accountId);
   if (accountId && accountId !== (accountForRecord(rec) || {}).id) await switchAccount({ recordId: rec.id, accountId });
-  return { record: publicRecord(history.get(rec.id)), settings: publicSettings() };
+  return publicRecord(history.get(rec.id));
 });
 
 // The transfer planner. request: { sources: ['claude:<id>', ...], tool, target?, preview?, retry? }.
