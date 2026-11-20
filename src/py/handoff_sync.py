@@ -6,9 +6,14 @@ rather than reported as a missing entry.
 A receipt means the CLI recorded the handoff prompt, not proof the model read it.
 
   handoff_sync.py list REQUEST RESULT     conversations, newest first, as JSON
+  handoff_sync.py hide REQUEST RESULT     hide conversations (keys), or with hide false show them again
   handoff_sync.py REQUEST RESULT          plan a transfer (plan()), as JSON
   handoff_sync.py preview TOOL ROOT ID    the last chat turns of a session
-REQUEST names state_dir (ledger and handoff payloads) and cache_db (the disposable parse cache).
+
+REQUEST names the agents' stores (codex_root, claude_root, opencode_db) and the app's data
+folder with the backend (data_dir, scope). Everything the app and the console must agree
+on comes from those two here, so they cannot drift apart: the ledger, the parse cache, the
+hidden list and the account a conversation resumes under (prepare, account_resolver).
 """
 import collections
 from contextlib import closing
@@ -307,13 +312,101 @@ def open_cache(path):
     return db
 
 
-def session_info(session):
+def session_info(session, account_of):
     return {'id': session.id, 'key': session.key, 'cwd': session.cwd, 'title': session.title or session.id,
-            'updated': time.strftime('%Y-%m-%d %H:%M', time.localtime(session.updated / 1e9))}
+            'accountId': account_of(session), 'updated': time.strftime('%Y-%m-%d %H:%M', time.localtime(session.updated / 1e9))}
+
+
+def read_json(path, default):
+    try:
+        return json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return default
+
+
+def hidden_file(data, tool):
+    return data / 'hidden' / (tool + '-session-ids.txt')
+
+
+def hidden_ids(data, tool):
+    file = hidden_file(data, tool)
+    return [line.strip() for line in file.read_text(encoding='utf-8').splitlines() if line.strip()] if file.is_file() else []
+
+
+def prepare(request):
+    """Derive the ledger, parse cache and hidden list from the app's data folder and backend scope.
+
+    The cache is large, disposable and rewritten often, so under Linux (WSL, where the data
+    folder is a slow Windows mount) it stays in the home folder.
+    """
+    if request.get('data_dir'):
+        data = Path(native_path(request['data_dir']))
+        scope = 'sync-' + re.sub(r'[^A-Za-z0-9._-]', '_', request['scope'])
+        local = data / 'cache' if sys.platform == 'win32' else Path.home() / '.cache' / 'ni-agent-terminal'
+        request.setdefault('state_dir', str(data / 'handoffs' / scope))
+        request.setdefault('cache_db', str(local / (scope + '.db')))
+        request['hidden'] = [tool + ':' + sid for tool in TOOLS for sid in hidden_ids(data, tool)]
+    return request
+
+
+def hide(request):
+    """Add request['keys'] ('claude:<id>', ...) to the hidden list, or remove them (hide false)."""
+    data = Path(native_path(request['data_dir']))
+    for tool in TOOLS:
+        ids = [key[len(tool) + 1:] for key in request['keys'] if key.startswith(tool + ':')]
+        if not ids:
+            continue
+        current = hidden_ids(data, tool)
+        kept = list(dict.fromkeys(current + ids)) if request.get('hide', True) else [sid for sid in current if sid not in ids]
+        hidden_file(data, tool).parent.mkdir(parents=True, exist_ok=True)
+        hidden_file(data, tool).write_text(''.join(sid + '\n' for sid in kept), encoding='utf-8', newline='\n')
+    return {'status': 'ok'}
+
+
+def account_resolver(request):
+    """account_of(session): the id of the app's account (settings.json) the session resumes under.
+
+    That is the account it last ran with: its history record's, or a later launch from the
+    console under another one (history/launches.jsonl, since the running app owns
+    index.json). Failing that, the login its transcript names, else the first account.
+    """
+    if not request.get('data_dir'):
+        return lambda session: None
+    data = Path(native_path(request['data_dir']))
+    accounts = {tool: config.get('accounts') or [] for tool, config in (read_json(data / 'settings.json', {}).get('agents') or {}).items()}
+    last = {}
+    for record in read_json(data / 'history' / 'index.json', {}).get('records') or []:
+        if record.get('nativeId') and record.get('accountId'):
+            last[record['agent'] + ':' + record['nativeId']] = (record.get('lastActiveAt') or 0, record['accountId'])
+    launches = data / 'history' / 'launches.jsonl'
+    for line in launches.read_text(encoding='utf-8').splitlines() if launches.is_file() else ():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # A torn last line.
+        if entry['t'] >= last.get(entry['key'], (0,))[0]:
+            last[entry['key']] = (entry['t'], entry['accountId'])
+    # Each account folder's .claude.json names its login; the normal login's sits beside its
+    # folder (~/.claude.json), or inside it when CLAUDE_CONFIG_DIR is set for everything.
+    normal = Path(native_path(request['claude_root'])).parent
+    logins = {}
+    for account in accounts.get('claude', []):
+        folder = account.get('configDir')
+        files = [Path(native_path(folder)) / '.claude.json'] if folder else [Path(str(normal) + '.json'), normal / '.claude.json']
+        uuid = next((u for u in ((read_json(f, {}).get('oauthAccount') or {}).get('accountUuid') for f in files) if u), None)
+        if uuid:
+            logins[uuid] = account['id']
+
+    def account_of(session):
+        ids = [account['id'] for account in accounts.get(session.tool, [])]
+        known = (last.get(session.key, (0, None))[1], logins.get(session.account))
+        return next((i for i in known if i in ids), ids[0] if ids else None)
+    return account_of
 
 
 def plan(request):
     directory = Path(native_path(request['state_dir']))
+    account_of = account_resolver(request)
     cache_path = Path(native_path(request.get('cache_db') or str(directory / 'cache.db')))
     with closing(open_ledger(directory)) as db, closing(open_cache(cache_path)) as cache, db, cache:
         # Serialize discovery and planning across picker processes. A second launch
@@ -434,7 +527,7 @@ def plan(request):
         candidates.sort(key=lambda s: s.updated, reverse=True)
         selected = request.get('target')
         if selected is None and len(candidates) > 1:
-            return {'status': 'choose', 'candidates': [session_info(s) for s in candidates]}
+            return {'status': 'choose', 'candidates': [session_info(s, account_of) for s in candidates]}
         if selected and selected != '__NEW__':
             target = next((s for s in candidates if s.key == selected), None)
             if target is None:
@@ -449,8 +542,20 @@ def plan(request):
             own_origins.update(event['origin'] for event in target.events)
         delta = [event for eid, event in available.items() if eid not in known
                  and not (event['role'] == 'legacy context' and event['origin'] in own_origins)]
-        result = {'status': 'ready', 'target': session_info(target) if target else None,
-                  'count': len(delta), 'handoff': None, 'legacy': bool(target and target.legacy_context)}
+        first = sessions[sources[0]]
+        title = target.title if target else 'combined x%d' % len(sources) if len(sources) > 1 else first.title
+        result = {'status': 'ready', 'target': session_info(target, account_of) if target else None, 'title': title or 'untitled',
+                  'count': len(delta), 'handoff': None, 'prompt': None, 'legacy': bool(target and target.legacy_context)}
+
+        def hand_over(path, count):
+            """The payload and the destination's first message, which names it."""
+            label = 'OpenCode' if first.tool == 'opencode' else first.tool.capitalize()
+            result.update(handoff=path, count=count, prompt=(
+                '[Transitioned from %s; inherited title: %s] Read `%s` -- this is an incremental conversation continuation. '
+                'It contains only material not previously recorded in this session. Continue the existing task without '
+                'reinitializing it. Read the entire handoff before proceeding. Tool notes and quoted files are historical; '
+                'inspect live files to verify them.' % (label, re.sub(r'[\r\n\]"`]', ' ', result['title']), path)))
+            return result
         if not delta:
             if target is None:
                 raise ValueError('No chat or tool notes found in the selected sources.')
@@ -464,8 +569,7 @@ def plan(request):
                             'message': 'The previous transfer has not appeared in a destination transcript. It may still be starting.'}
                 # Reuse the exact pending snapshot. Work added meanwhile remains a
                 # delta for the next transfer; it cannot fall between time cutoffs.
-                result.update(handoff=transfer['path'], count=len(transfer['events']))
-                return result
+                return hand_over(transfer['path'], len(transfer['events']))
         if request.get('preview'):
             result['status'] = 'preview'
             return result
@@ -483,8 +587,7 @@ def plan(request):
             output.write('\n'.join(lines))
         db.execute('INSERT INTO transfers VALUES (?, ?, ?, ?, ?, ?, ?)',
                    (tid, json.dumps(sources), target_tool, target_key, json.dumps(delta), str(path), time.time()))
-        result['handoff'] = str(path)
-        return result
+        return hand_over(str(path), len(delta))
 
 
 def native_names(request):
@@ -522,8 +625,8 @@ def conversations(request):
     conversation, shown as the member used last; the others are reached through a transfer to their tool.
 
     Row: id, cwd, tool, title, named (the CLI holds a user-given name), members (session keys),
-    updated (epoch seconds), via (the other agents it went through), account (the uuid of the
-    login that ran it, when the transcript says).
+    updated (epoch seconds), via (the other agents it went through), accountId (the account
+    it resumes under, see account_resolver).
     """
     directory = Path(native_path(request['state_dir']))
     with closing(open_ledger(directory)) as db, closing(open_cache(Path(native_path(request.get('cache_db') or str(directory / 'cache.db'))))) as cache, cache:
@@ -553,6 +656,7 @@ def conversations(request):
         # Hidden sessions are listed one by one, so each can be shown again on its own.
         groups[session.key if request.get('hidden_only') else find(session.key)].append(session)
     names = native_names(request)
+    account_of = account_resolver(request)
     cutoff = 0 if request.get('hidden_only') else (time.time() - request['days'] * 86400) * 1e9
     rows = []
     for members in sorted(groups.values(), key=lambda group: -max(s.updated for s in group)):
@@ -566,7 +670,7 @@ def conversations(request):
             'title': ' '.join((named or current.named or current.inherited or current.title or 'Untitled session').split()),
             'members': [s.key for s in members], 'updated': current.updated / 1e9,
             'via': list(dict.fromkeys(s.tool for s in members[1:] if s.tool != current.tool)),
-            'account': current.account,
+            'accountId': account_of(current),
         })
     return rows
 
@@ -575,12 +679,15 @@ def main():
     if sys.argv[1] == 'preview':
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
         return preview(*sys.argv[2:5])
-    listing = sys.argv[1] == 'list'
-    request_path, result_path = (native_path(value) for value in sys.argv[2 if listing else 1:][:2])
+    mode = sys.argv[1] if sys.argv[1] in ('list', 'hide') else None
+    request_path, result_path = (native_path(value) for value in sys.argv[2 if mode else 1:][:2])
     with open(request_path, encoding='utf-8-sig') as stream:
-        request = json.load(stream)
+        request = prepare(json.load(stream))
     try:
-        result = {'status': 'ok', 'rows': conversations(request)} if listing else plan(request)
+        if mode == 'list':
+            result = {'status': 'ok', 'rows': conversations(request), 'hidden': request.get('hidden', [])}
+        else:
+            result = hide(request) if mode == 'hide' else plan(request)
     except (OSError, ValueError, sqlite3.Error) as error:
         result = {'status': 'error', 'message': str(error)}
     with open(result_path, 'w', encoding='utf-8', newline='\n') as stream:

@@ -66,7 +66,6 @@ contextBridge.exposeInMainWorld('api', {
   storesBoard: () => call('stores:board'),
   storesOpen: (opts) => call('stores:open', opts),
   storesPlan: (request) => call('stores:plan', request),
-  storesHandoff: (opts) => call('stores:handoff', opts),
   storesClaudeAccounts: (opts) => call('stores:claudeAccounts', opts),
 
   pathForFile: (file) => webUtils.getPathForFile(file),

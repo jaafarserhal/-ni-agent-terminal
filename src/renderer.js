@@ -1655,13 +1655,12 @@ async function transfer(items, tool) {
       plan = await ipc.storesPlan(req);
     }
     if (plan.status !== 'ready') throw new Error(`Unexpected synchronization status: ${plan.status}`);
-    const h = await ipc.storesHandoff({ plan, items, cwd });
     state.agentsMarked.clear();
     invalidateAll();
     toast(plan.handoff ? `Continuing with ${plan.count} new messages/tool notes` : 'Already synchronized; resuming without adding a prompt');
     // An existing destination resumes under its own last account; a new one is a new chat.
-    if (plan.target) await openNative({ tool, id: plan.target.id, cwd: plan.target.cwd, title: h.title }, null, h.prompt);
-    else await newTab({ agent: tool, cwd: h.cwd, mode: 'new', prompt: h.prompt });
+    if (plan.target) await openNative({ tool, ...plan.target }, null, plan.prompt);
+    else await newTab({ agent: tool, cwd: items.find((r) => r.cwd === (cwd || items[0].cwd)).winCwd, mode: 'new', prompt: plan.prompt });
   } catch (err) {
     toast(`Conversation transfer stopped: ${err.message}`);
   }

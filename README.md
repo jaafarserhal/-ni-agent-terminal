@@ -76,6 +76,24 @@ With **Python 3** (with SQLite) in the backend:
 - *Link accounts* (Setup → Claude): every `~/.claude-<n>` login shares `~/.claude`'s history, keeping its own login, and conversations are labelled with their login. *New linked account* creates the next one. On Windows this needs Git for Windows and Developer Mode (symlinks).
 - Each agent's history is snapshotted once a day into `backups\<tool>` (the newest ten kept).
 
+## AgentSessionHub (console)
+
+`hub\AgentSessionHub.cmd` (`npm run hub`) opens the same conversations in Windows Terminal, for when a console is preferred or the app is not available: a fuzzy-search list (fzf) of every Claude, Codex and OpenCode conversation with transcript previews, and a live board of running sessions. Its agent tabs are ordinary Windows Terminal tabs.
+
+It has no settings or state of its own. It reads this app's `settings.json` (where agents run, which are on, the Claude accounts, the first workspace folder for new sessions) and runs the same engine (`src\py`) on the same data folder, so the handoff ledger, hidden list, backups and each conversation's account are the same in both. Run this app's Setup once first.
+
+| Action | Key |
+| --- | --- |
+| Search | Type to filter |
+| Resume the highlighted conversation, in its latest agent and account | Enter |
+| Open with another agent (handoff) or under another Claude account | Alt+T |
+| Mark conversations to combine into one | Tab, then Enter or Alt+T |
+| Transcript preview | Alt+P |
+| Hide / show hidden | Alt+H / Alt+S |
+| Reload | Esc |
+
+Mouse: a click highlights a row, a second click on it opens it. The first row starts a new session: agent, account (when Claude has several), then folder. It needs Windows Terminal, fzf (the Linux build inside WSL; `fzf.exe` and PowerShell 7 on Windows) and Python 3.8+. `hub\fixclip.cmd` re-owns the clipboard text when RDP stops forwarding what Windows Terminal copied.
+
 ## Keys
 
 | Key | Action |
@@ -107,6 +125,7 @@ npm start               # run from source
 npm run shortcut        # Start menu shortcut to run this checkout (pin it to Start or the taskbar)
 npm run check           # syntax check
 npm test                # src/py tests (Python 3)
+npm run test:hub        # hub checks on throwaway data (Git for Windows, Python)
 npm run dist            # portable + installer exe into dist\
 ```
 

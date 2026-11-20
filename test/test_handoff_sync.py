@@ -15,7 +15,7 @@ import sys
 
 ENGINE = Path(__file__).resolve().parents[1] / 'src' / 'py'
 sys.path.insert(0, str(ENGINE))
-from handoff_sync import conversations, plan, preview  # noqa: E402
+from handoff_sync import conversations, hide, plan, prepare, preview  # noqa: E402
 
 LINK_SCRIPT = ENGINE / 'claude-accounts.sh'
 
@@ -30,7 +30,7 @@ class TransferTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "space O'Brien"
         self.root.mkdir()
-        self.request = {'state_dir': str(self.root / 'state'), 'codex_root': str(self.root / 'codex'),
+        self.request = {'state_dir': str(self.root / 'state'), 'cache_db': str(self.root / 'cache.db'), 'codex_root': str(self.root / 'codex'),
                         'claude_root': str(self.root / 'claude'), 'opencode_db': str(self.root / 'override.db')}
         with closing(sqlite3.connect(self.request['opencode_db'])) as db, db:
             db.execute('CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_updated INTEGER, parent_id TEXT, time_archived INTEGER)')
@@ -101,17 +101,43 @@ class TransferTests(unittest.TestCase):
 
         self.assertEqual(self.listed(), [('claude', 'interactive chat', [self.key('claude')])])
 
-    def test_history_names_the_login_that_ran_a_conversation(self):
+    def test_a_conversation_resumes_under_the_account_it_last_ran_with(self):
+        data = self.root / 'data'
+        (data / 'history').mkdir(parents=True)
         folder = Path(self.request['claude_root'])
         folder.mkdir()
-        rows = {'owned': [{'type': 'session-owner', 'accountUuid': 'creator'}],
-                # A bridge names the login that was running; later owner records still name the creator.
-                'continued': [{'type': 'session-owner', 'accountUuid': 'creator'}, {'type': 'bridge-session', 'ownerAccountUuid': 'other'},
-                              {'type': 'session-owner', 'accountUuid': 'creator'}]}
-        for sid, records in rows.items():
-            (folder / (sid + '.jsonl')).write_text(''.join(json.dumps(r) + '\n' for r in [{'type': 'user', 'cwd': str(self.root), 'message': {'content': sid}}] + records))
-        listed = {row['id']: row['account'] for row in conversations({**self.request, 'tools': ['claude'], 'days': 40})}
-        self.assertEqual({'owned': 'creator', 'continued': 'other'}, listed)
+        other = self.root / 'other-login'
+        other.mkdir()
+        (data / 'settings.json').write_text(json.dumps({'agents': {'claude': {'accounts': [
+            {'id': 'first', 'configDir': ''}, {'id': 'second', 'configDir': str(other)}]}}}))
+        Path(str(folder.parent) + '.json').write_text(json.dumps({'oauthAccount': {'accountUuid': 'u-first'}}))
+        (other / '.claude.json').write_text(json.dumps({'oauthAccount': {'accountUuid': 'u-second'}}))
+        owner, bridge = {'type': 'session-owner', 'accountUuid': 'u-first'}, {'type': 'bridge-session', 'ownerAccountUuid': 'u-second'}
+        transcripts = {'created': [owner],
+                       # A bridge names the login that was running; later owner records still name the creator.
+                       'continued': [owner, bridge, owner],
+                       'recorded': [owner], 'relaunched': [owner, bridge], 'unknown': []}
+        for sid, records in transcripts.items():
+            rows = [{'type': 'user', 'cwd': str(self.root), 'message': {'content': sid}}] + records
+            (folder / (sid + '.jsonl')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        (data / 'history' / 'index.json').write_text(json.dumps({'records': [
+            {'agent': 'claude', 'nativeId': 'recorded', 'accountId': 'second', 'lastActiveAt': 100},
+            {'agent': 'claude', 'nativeId': 'relaunched', 'accountId': 'second', 'lastActiveAt': 100}]}))
+        (data / 'history' / 'launches.jsonl').write_text(json.dumps({'key': 'claude:relaunched', 'accountId': 'first', 't': 200}) + '\n')
+        request = prepare({**self.request, 'data_dir': str(data), 'scope': 'test', 'tools': ['claude'], 'days': 40})
+        self.assertEqual({'created': 'first', 'continued': 'second', 'recorded': 'second', 'relaunched': 'first', 'unknown': 'first'},
+                         {row['id']: row['accountId'] for row in conversations(request)})
+
+    def test_hidden_conversations_leave_the_list_until_shown_again(self):
+        data = self.root / 'data'
+        self.append('claude', 'kept')
+        self.append('codex', 'gone')
+        request = {**self.request, 'data_dir': str(data), 'scope': 'test', 'tools': list(IDS), 'days': 40}
+        hide(prepare({**request, 'keys': [self.key('codex')]}))
+        self.assertEqual(['kept'], [row['title'] for row in conversations(prepare(dict(request)))])
+        self.assertEqual(['gone'], [row['title'] for row in conversations(prepare(dict(request, hidden_only=True)))])
+        hide(prepare({**request, 'keys': [self.key('codex')], 'hide': False}))
+        self.assertEqual(['gone', 'kept'], sorted(row['title'] for row in conversations(prepare(dict(request)))))
 
     def test_preview_shows_the_last_chat_turns_of_each_tool(self):
         for tool in ('codex', 'claude', 'opencode'):
@@ -237,6 +263,14 @@ class TransferTests(unittest.TestCase):
         self.append('claude', 'work')
         self.append('claude', '[Transitioned from Codex; inherited title: x] Read /other/handoffs/hub-transfer-' + 'a' * 32 + '.md -- go')
         self.assertEqual('preview', self.transfer([self.key('claude')], 'codex', preview=True)['status'])
+
+    def test_a_handoff_comes_with_the_message_that_names_it(self):
+        self.append('claude', 'Fix "the" parser')
+        result = self.transfer([self.key('claude')], 'codex')
+        self.assertTrue(result['prompt'].startswith(
+            '[Transitioned from Claude; inherited title: Fix  the  parser] Read `' + result['handoff'] + '` -- this is an incremental'))
+        self.accept(result, 'codex')
+        self.assertIsNone(self.transfer([self.key('claude')], 'codex')['prompt'])
 
     def test_handoffs_are_named_terminal_transfer(self):
         self.append('claude', 'work')

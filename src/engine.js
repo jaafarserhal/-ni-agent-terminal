@@ -1,7 +1,8 @@
 'use strict';
 // The agents' own stores across agents (History → Agents, Live) and handoffs between agents,
 // through the Python scripts in src/py, run in the agents' backend (Python 3 with SQLite):
-//   handoff_sync.py     list / preview / plan, with the handoff ledger in <data>/handoffs/<scope>
+//   handoff_sync.py     list / preview / plan / hide, with the handoff ledger, hidden list
+//                       and account rule derived from the data folder (shared with hub/)
 //   board.py            running sessions, their subagents and shells (via helpers.py)
 //   helpers.py          OpenCode sessions, daily backups
 //   claude-accounts.sh  numbered ~/.claude-<n> logins sharing ~/.claude's history
@@ -14,14 +15,6 @@ const ENGINE_AGENTS = ['codex', 'claude', 'opencode'];
 // Python reads these as files: in a packaged app they are unpacked beside the asar.
 const PY = path.join(__dirname.replace(/app\.asar([\\/]|$)/, 'app.asar.unpacked$1'), 'py');
 
-function readLines(file) {
-  try {
-    return fs.readFileSync(file, 'utf8').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  } catch (_) {
-    return [];
-  }
-}
-
 class Engine {
   // dataDir: the app's data folder.
   constructor(backend, dataDir) {
@@ -30,45 +23,16 @@ class Engine {
     this.tmp = path.join(dataDir, 'tmp');
   }
 
-  hiddenFile(tool) {
-    return path.join(this.dataDir, 'hidden', `${tool}-session-ids.txt`);
-  }
-
-  // Hidden conversations, one session id per line per agent.
-  hiddenKeys() {
-    return ENGINE_AGENTS.flatMap((tool) => readLines(this.hiddenFile(tool)).map((id) => `${tool}:${id}`));
-  }
-
-  // keys: ['claude:<id>', ...]; hidden adds them, otherwise they are shown again.
-  setHidden(keys, hidden) {
-    for (const tool of ENGINE_AGENTS) {
-      const ids = keys.filter((k) => k.startsWith(`${tool}:`)).map((k) => k.slice(tool.length + 1));
-      if (!ids.length) continue;
-      const file = this.hiddenFile(tool);
-      const cur = readLines(file);
-      const next = hidden ? [...new Set([...cur, ...ids])] : cur.filter((id) => !ids.includes(id));
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, next.map((id) => id + '\n').join(''));
-    }
-  }
-
-  stores() {
+  // What the engine needs: the agents' stores, and the app's data folder with the backend,
+  // from which it derives the ledger, the hidden list and each conversation's account.
+  request() {
     return {
       codex_root: `${this.b.configDir('codex')}/sessions`,
       // Linked Claude accounts share the normal login's projects, so one root covers them all.
       claude_root: `${this.b.configDir('claude')}/projects`,
       opencode_db: this.b.opencodeDb(),
-    };
-  }
-
-  // The ledger is kept per backend: each has its own stores. The parse cache is large,
-  // disposable and rewritten often, so in WSL it stays on WSL's own disk.
-  request() {
-    const scope = `sync-${this.b.scope.replace(/[^A-Za-z0-9._-]/g, '_')}`;
-    return {
-      ...this.stores(),
-      state_dir: this.b.toAgent(path.join(this.dataDir, 'handoffs', scope)),
-      cache_db: this.b.kind === 'wsl' ? this.b.agentPath('.cache', 'ni-agent-terminal', `${scope}.db`) : path.join(this.dataDir, 'cache', `${scope}.db`),
+      data_dir: this.b.toAgent(this.dataDir),
+      scope: this.b.scope,
     };
   }
 
@@ -97,30 +61,29 @@ class Engine {
     }
   }
 
-  // Conversations newest first: { key, id, cwd (the agent's), winCwd, tool, title, members,
-  // updated, via, account (the uuid of the login that ran it, when its transcript says) }.
+  // { rows, hidden }. rows: conversations newest first: { key, id, cwd (the agent's), winCwd,
+  // tool, title, members, updated, via, accountId (the account it resumes under) };
+  // hidden: the keys of every hidden session.
   async list({ tools, days, hiddenOnly = false }) {
-    const res = await this.engine('list', { tools, days, hidden: this.hiddenKeys(), hidden_only: hiddenOnly });
-    return res.rows.map((r) => ({ ...r, key: `${r.tool}:${r.id}`, winCwd: this.b.toWin(r.cwd) }));
+    const res = await this.engine('list', { tools, days, hidden_only: hiddenOnly });
+    return { hidden: res.hidden, rows: res.rows.map((r) => ({ ...r, key: `${r.tool}:${r.id}`, winCwd: this.b.toWin(r.cwd) })) };
+  }
+
+  // keys: ['claude:<id>', ...]; hidden adds them to the hidden list, otherwise they are shown again.
+  setHidden(keys, hidden) {
+    return this.engine('hide', { keys, hide: hidden });
   }
 
   async preview(tool, id) {
     await this.b.ready();
-    const s = this.stores();
+    const s = this.request();
     const root = tool === 'codex' ? s.codex_root : tool === 'claude' ? s.claude_root : s.opencode_db;
     return this.py('handoff_sync.py', ['preview', tool, root, id]);
   }
 
-  // The transfer planner: { status: choose | preview | pending | ready, ... }.
+  // The transfer planner: { status: choose | preview | pending | ready, target, title, handoff, prompt, ... }.
   plan(request) {
     return this.engine(null, request);
-  }
-
-  // The first message of a handoff.
-  handoffPrompt(file, fromTool, title) {
-    const label = fromTool === 'opencode' ? 'OpenCode' : fromTool[0].toUpperCase() + fromTool.slice(1);
-    const clean = (title || 'untitled').replace(/[\r\n\]"]/g, ' ');
-    return `[Transitioned from ${label}; inherited title: ${clean}] Read \`${file}\` -- this is an incremental conversation continuation. It contains only material not previously recorded in this session. Continue the existing task without reinitializing it. Read the entire handoff before proceeding. Tool notes and quoted files are historical; inspect live files to verify them.`;
   }
 
   // claude-accounts.sh: links every ~/.claude-<n> to ~/.claude (optionally creating the

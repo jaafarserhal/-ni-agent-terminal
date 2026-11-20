@@ -46,7 +46,6 @@ class WindowsBackend {
     this.label = 'Windows';
     this.scope = 'windows'; // names this backend's handoff ledger (engine.js)
     this.home = os.homedir();
-    this.gitBash = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe');
   }
 
   ready() {
@@ -82,9 +81,16 @@ class WindowsBackend {
   }
 
   // Git for Windows' bash runs the shell scripts in src/py; path arguments are /c/... (msysPath).
+  // It is in Program Files, in a per-user install, or beside the git on PATH (<Git>\cmd).
   bash(args, opts) {
-    if (!fs.existsSync(this.gitBash)) throw new Error(`Git for Windows is needed for this: ${this.gitBash} not found`);
-    return run(this.gitBash, args, opts);
+    const roots = [
+      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git'),
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Git'),
+      ...(process.env.Path || process.env.PATH || '').split(path.delimiter).filter((p) => /[\\/]cmd[\\/]?$/i.test(p)).map((p) => path.dirname(p)),
+    ];
+    const bash = roots.map((r) => path.join(r, 'bin', 'bash.exe')).find((f) => fs.existsSync(f));
+    if (!bash) throw new Error('Git for Windows is needed for this (its bash runs the script); it was not found.');
+    return run(bash, args, opts);
   }
 
   // `python`, else the py launcher; the Store's python.exe alias only prints a hint and fails.

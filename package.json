@@ -11,6 +11,8 @@
     "start": "electron .",
     "shortcut": "electron . --install-shortcut",
     "test": "python -m unittest discover -s test",
+    "test:hub": "powershell -NoProfile -ExecutionPolicy Bypass -File hub\\test_hub.ps1",
+    "hub": "hub\\AgentSessionHub.cmd",
     "check": "node --check src/main.js && node --check src/preload.js && node --check src/history.js && node --check src/agents.js && node --check src/sessions.js && node --check src/backend.js && node --check src/engine.js && node --check src/renderer.js",
     "dist": "electron-builder --win portable nsis",
     "dist:portable": "electron-builder --win portable"

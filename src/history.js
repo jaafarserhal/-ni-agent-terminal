@@ -89,10 +89,10 @@ class History {
         fs.rmdirSync(path.join(this.root, agent)); // only succeeds once empty
       } catch (_) { /* still has files */ }
     }
-    this._saveNow();
+    this.saveNow();
   }
 
-  _saveNow() {
+  saveNow() {
     clearTimeout(this._saveTimer);
     this._saveTimer = null;
     const tmp = this.indexFile + '.tmp';
@@ -101,11 +101,11 @@ class History {
   }
 
   save() {
-    if (!this._saveTimer) this._saveTimer = setTimeout(() => this._saveNow(), 500);
+    if (!this._saveTimer) this._saveTimer = setTimeout(() => this.saveNow(), 500);
   }
 
   flush() {
-    if (this._saveTimer) this._saveNow();
+    if (this._saveTimer) this.saveNow();
     for (const s of this.streams.values()) s.stream.end();
     this.streams.clear();
   }

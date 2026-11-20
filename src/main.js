@@ -962,38 +962,20 @@ function recordForNative(tool, id, cwd, title, accountId) {
   });
 }
 
-// Which Claude account each login is, by its uuid: every account folder's .claude.json names
-// its login. The normal login's file sits beside its folder (~/.claude.json), unless the app
-// inherited CLAUDE_CONFIG_DIR.
-function claudeLogins(b) {
-  const logins = new Map();
-  for (const acct of agentCfg('claude').accounts || []) {
-    const inside = acct.configDir || (b.kind === 'windows' && process.env.CLAUDE_CONFIG_DIR);
-    const file = b.toWin(inside ? `${inside}/.claude.json` : `${b.configDir('claude')}.json`);
-    const uuid = (readJson(file, {}).oauthAccount || {}).accountUuid;
-    if (uuid) logins.set(uuid, acct);
-  }
-  return logins;
-}
-
 // History → All: every conversation once. The agents' stores give the rows, where a
 // conversation handed between agents is one row under the agent used last; the history
 // records they do not cover (Shell, Cursor, another backend, older ones) follow as they are.
-// A row resumes under the account its record last ran with, else the login its transcript
-// names, else the first account. Without Python only the records are listed, with the reason.
+// Each row names the account it resumes under, which the engine decides from this history
+// (saved first, so it reads the current one). Without Python only the records are listed,
+// with the reason.
 handle('history:all', async ({ hiddenOnly } = {}) => {
-  const b = newBackend();
-  const engine = engineFor(b);
-  const res = await engine.list({ tools: engineAgents(), days: settings.agentsDays, hiddenOnly: !!hiddenOnly })
-    .then((rows) => ({ rows, logins: claudeLogins(b) }), (err) => ({ rows: [], logins: new Map(), error: err.message }));
-  const covered = new Set([...res.rows.flatMap((r) => r.members), ...engine.hiddenKeys()]);
+  history.saveNow();
+  const res = await engineFor(newBackend()).list({ tools: engineAgents(), days: settings.agentsDays, hiddenOnly: !!hiddenOnly })
+    .catch((err) => ({ rows: [], hidden: [], error: err.message }));
+  const covered = new Set([...res.rows.flatMap((r) => r.members), ...res.hidden]);
   return {
     error: res.error || null,
-    rows: res.rows.map((r) => {
-      const rec = history.findByNative(r.tool, r.id);
-      const acct = (rec && accountForRecord(rec)) || res.logins.get(r.account) || firstAccount(r.tool);
-      return { ...r, record: publicRecord(rec), accountId: acct ? acct.id : null, cwdLabel: workspace.labelFor(settings.workspaces, r.winCwd) };
-    }),
+    rows: res.rows.map((r) => ({ ...r, record: publicRecord(history.findByNative(r.tool, r.id)), cwdLabel: workspace.labelFor(settings.workspaces, r.winCwd) })),
     records: hiddenOnly ? [] : history.list({}).filter((rec) => !covered.has(`${rec.agent}:${rec.nativeId}`)).map(publicRecord),
   };
 });
@@ -1010,14 +992,9 @@ handle('stores:open', async ({ tool, id, cwd, title, accountId }) => {
 });
 
 // The transfer planner. request: { sources: ['claude:<id>', ...], tool, target?, preview?, retry? }.
-handle('stores:plan', (request) => engineFor(newBackend()).plan(request));
-
-// What a tab needs to continue a planned transfer: the handoff prompt (when there is new
-// material), the conversation's title and, for a new destination, its folder. items: the source rows.
-handle('stores:handoff', ({ plan, items, cwd }) => {
-  const b = newBackend();
-  const title = plan.target ? plan.target.title : items.length > 1 ? `combined x${items.length}` : items[0].title;
-  return { title, cwd: b.toWin(cwd || items[0].cwd), prompt: plan.handoff ? engineFor(b).handoffPrompt(plan.handoff, items[0].tool, title) : null };
+handle('stores:plan', (request) => {
+  history.saveNow();
+  return engineFor(newBackend()).plan(request);
 });
 
 // claude-accounts.sh: links every ~/.claude-<n> to ~/.claude's history and lists the logins.

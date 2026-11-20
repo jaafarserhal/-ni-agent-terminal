@@ -1,16 +1,18 @@
 """Live, read-only board of running agent sessions, their subagents and their shells.
 
-helpers.py serves collect() to the Live view.
+Run it for a console board that refreshes in place; helpers.py serves collect() to the app's Live board.
 
 Claude sessions are live while their recorded process exists. Codex and OpenCode keep no
 process record, so a session counts as active while it is busy or was updated recently.
 """
 from contextlib import closing
+import argparse
 import glob
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -198,9 +200,52 @@ def opencode_rows(database, cutoff):
     return list(tops.values())
 
 
+def age(since, now):
+    seconds = max(0, int(now - since))
+    for unit, size in (('d', 86400), ('h', 3600), ('m', 60)):
+        if seconds >= size:
+            return f'{seconds // size}{unit}'
+    return f'{seconds}s'
+
+
+def render(rows, now, width):
+    lines = [f"{'agent':<10}{'project':<20}{'state':<9}{'for':<5}{'model':<21}title / last action"]
+    for row in sorted(rows, key=lambda r: -r.since):
+        for item in [row] + sorted(row.children, key=lambda r: -r.since):
+            # A subagent or shell has no project of its own; its type goes in that column under the parent.
+            agent, project = (item.label, item.project) if item is row else ('  ' * item.depth + '\\_', item.label)
+            text = item.title + (f'  [{one_line(item.detail)}]' if item.detail else '')
+            lines.append(f'{agent:<10.9}{project:<20.19}{item.state:<9.8}{age(item.since, now):<5}{item.model:<21.20}{text}'[:width])
+    return lines if rows else lines + ['no active sessions']
+
+
 def collect(minutes):
     home = Path.home()
     cutoff = time.time() - minutes * 60
     data = Path(os.environ.get('XDG_DATA_HOME') or home / '.local' / 'share') / 'opencode'
     database = data / os.environ.get('OPENCODE_DB', 'opencode.db')  # An absolute OPENCODE_DB replaces the folder.
     return claude_rows(home / '.claude', cutoff) + codex_rows(home / '.codex', cutoff) + opencode_rows(database, cutoff)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--minutes', type=int, default=30, help='how long a Codex/OpenCode session or a finished subagent stays listed')
+    parser.add_argument('--interval', type=float, default=3, help='seconds between refreshes')
+    parser.add_argument('--once', action='store_true', help='print one snapshot and exit')
+    options = parser.parse_args()
+    while True:
+        lines = render(collect(options.minutes), time.time(), shutil.get_terminal_size((160, 40)).columns)
+        if options.once:
+            print('\n'.join(lines))
+            return
+        # Home the cursor and clear below it, so a refresh never scrolls the tab.
+        sys.stdout.write('\x1b[H\x1b[J' + '\n'.join(lines) + '\n')
+        sys.stdout.flush()
+        time.sleep(options.interval)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

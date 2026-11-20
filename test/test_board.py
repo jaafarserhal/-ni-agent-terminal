@@ -99,5 +99,15 @@ class BoardTest(unittest.TestCase):
                          [('busy one', 'working', 'kimi', 1), ('idle one', 'idle', 'kimi', 0)])
 
 
+    def test_render_nests_subagents_under_their_session(self):
+        parent = board.Row('claude', 'proj', 'parent', 'busy', self.now - 90, model='fable-5')
+        parent.children.append(board.Row('Explore', '', 'child', 'running', self.now - 5, depth=1))
+
+        lines = board.render([parent], self.now, 200)
+
+        self.assertEqual([line.split() for line in lines[1:]],
+                         [['claude', 'proj', 'busy', '1m', 'fable-5', 'parent'], ['\\_', 'Explore', 'running', '5s', 'child']])
+
+
 if __name__ == '__main__':
     unittest.main()
