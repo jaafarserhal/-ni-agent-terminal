@@ -9,7 +9,7 @@
 </head>
 <body>
   <header id="titlebar">
-    <div class="brand" title="NI Agent Terminal">
+    <div id="brand" class="brand" title="NI Agent Terminal (click to reload the window, keeping tabs and agents running)">
       <img src="icon.png" alt="" />
     </div>
     <div id="tabs" role="tablist"></div>
@@ -19,6 +19,10 @@
       </button>
     </div>
     <div class="drag-spacer"></div>
+    <button id="btn-live" class="icon-btn text-btn" title="Running sessions with their state, model, last action, subagents and shells">
+      <svg viewBox="0 0 16 16" width="14" height="14"><path d="M1.5 8h3l2-5 3 10 2-5h3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Live</span>
+    </button>
     <button id="btn-history" class="icon-btn text-btn" title="History (Ctrl+Shift+H)">
       <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 4v4l2.5 1.5M2.5 8a5.5 5.5 0 1 0 1.6-3.9M2 2.5v2.6h2.6" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <span>History</span>
@@ -38,7 +42,7 @@
       </div>
     </label>
     <div id="new-agents"></div>
-    <div class="popover-hint">Ctrl+Shift+1…4 opens an agent in the current tab's folder</div>
+    <div class="popover-hint">Ctrl+Shift+1…5 opens an agent in the current tab's folder</div>
   </div>
 
   <main id="main">
@@ -53,6 +57,20 @@
         <button id="find-prev" class="small-btn" title="Previous (Shift+Enter)">↑</button>
         <button id="find-next" class="small-btn" title="Next (Enter)">↓</button>
         <button id="find-close" class="small-btn" title="Close (Esc)">✕</button>
+      </div>
+      <div id="live" class="viewer live hidden">
+        <div class="viewer-head">
+          <div class="viewer-title">
+            <div>
+              <div class="name">Live</div>
+              <div class="meta">Running Claude, Codex and OpenCode sessions, in or outside this app, with their subagents and shells</div>
+            </div>
+          </div>
+          <div class="viewer-actions">
+            <button id="live-close" class="small-btn" title="Close (Esc)">✕</button>
+          </div>
+        </div>
+        <div id="live-list"></div>
       </div>
       <div id="viewer" class="viewer hidden">
         <div class="viewer-head">
@@ -79,6 +97,7 @@
     </section>
 
     <aside id="history" class="hidden" aria-label="History">
+      <div id="history-resize" title="Drag to resize · double-click to reset"></div>
       <div class="side-head">
         <h3>History</h3>
         <button id="history-folder" class="small-btn" title="Open the history files on disk">Files</button>
@@ -86,20 +105,30 @@
       <div class="seg filter" id="history-scope">
         <button data-scope="tab" class="on" title="Prompts and conversations of the active tab">This tab</button>
         <button data-scope="folder" title="Sessions started in one folder">Folder</button>
-        <button data-scope="all" title="Every session, all folders">All</button>
+        <button data-scope="all" title="Every conversation, all folders: this app's and those in the agents' own stores, one entry per conversation across agents">All</button>
       </div>
       <div id="history-folder-row" class="folder-row hidden">
         <select id="history-folder-select" title="Folder"></select>
         <button id="history-import" class="small-btn hidden" title="Add conversations found in the agents' own stores for this folder"></button>
+      </div>
+      <div id="history-agents-row" class="folder-row hidden">
+        <span id="history-agents-marked" class="agents-marked"></span>
+        <span class="st-fill"></span>
+        <button id="history-agents-hidden" class="small-btn" title="List the hidden conversations">Hidden</button>
+        <button id="history-agents-reload" class="small-btn" title="Read the agents' stores again">Reload</button>
       </div>
       <div class="seg filter" id="history-filter">
         <button data-agent="all" class="on">All</button>
         <button data-agent="claude">Claude</button>
         <button data-agent="codex">Codex</button>
         <button data-agent="cursor">Cursor</button>
+        <button data-agent="opencode">OpenCode</button>
         <button data-agent="shell">Shell</button>
       </div>
-      <input id="history-search" class="search" placeholder="Search title, folder or id" spellcheck="false" />
+      <div class="search">
+        <input id="history-search" placeholder="Search title, folder or id" spellcheck="false" />
+        <button id="history-search-clear" class="hidden" title="Clear the search (Esc)" aria-label="Clear the search">✕</button>
+      </div>
       <div id="history-tabhead" class="tabhead"></div>
       <div id="history-list"></div>
     </aside>

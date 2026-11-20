@@ -5,12 +5,17 @@
 // accounts. A Claude / Codex account is a config folder (its own login and
 // conversation store), passed through the environment variable named by configEnv.
 // Cursor Agent keeps one config folder, so a Cursor account is an API key (keyEnv).
+// `prompt` is a first message to send on launch: a handoff from another conversation.
+// `inline` flags keep a full-screen TUI in the terminal's normal buffer for this launch only,
+// whatever the user's own settings say: in the alternate screen with mouse tracking the
+// app has no scrollback, the wheel goes to the agent, and text cannot be selected to copy.
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
 const HOME = os.homedir();
+const positional = (prompt) => [prompt];
 
 const AGENTS = {
   claude: {
@@ -20,9 +25,11 @@ const AGENTS = {
     color: '#d97757',
     accountKind: 'dir',
     configEnv: 'CLAUDE_CONFIG_DIR',
-    defaultConfigDir: path.join(HOME, '.claude'),
     // Claude accepts a caller-chosen session id, so the id is known before launch.
     presetId: true,
+    // A settings file (main.js writes it), not inline JSON: quotes do not survive every launch form.
+    inline: (settingsFile) => ['--settings', settingsFile],
+    prompt: positional,
     args(mode, nativeId) {
       if (mode === 'resume' && nativeId) return ['--resume', nativeId];
       if (mode === 'new' && nativeId) return ['--session-id', nativeId];
@@ -38,8 +45,11 @@ const AGENTS = {
     color: '#10a37f',
     accountKind: 'dir',
     configEnv: 'CODEX_HOME',
-    defaultConfigDir: path.join(HOME, '.codex'),
     presetId: false,
+    // Before the subcommand. A config override, not --no-alt-screen: an older Codex ignores
+    // an unknown key but rejects an unknown flag.
+    inline: () => ['-c', 'tui.fullscreen_transcript=false'],
+    prompt: positional,
     args(mode, nativeId) {
       if (mode === 'resume' && nativeId) return ['resume', nativeId];
       if (mode === 'continue') return ['resume', '--last'];
@@ -55,10 +65,25 @@ const AGENTS = {
     accountKind: 'key',
     keyEnv: 'CURSOR_API_KEY',
     presetId: false,
+    prompt: positional,
     args(mode, nativeId) {
       if (mode === 'resume' && nativeId) return ['--resume', nativeId];
       if (mode === 'continue') return ['resume'];
       if (mode === 'picker') return ['ls'];
+      return [];
+    },
+  },
+  // One SQLite store for every folder; its conversations are found through Python (engine.js).
+  opencode: {
+    id: 'opencode',
+    label: 'OpenCode',
+    command: 'opencode',
+    color: '#e0a03c',
+    presetId: false,
+    prompt: (prompt) => ['--prompt', prompt],
+    args(mode, nativeId) {
+      if (mode === 'resume' && nativeId) return ['--session', nativeId];
+      if (mode === 'continue') return ['--continue'];
       return [];
     },
   },
@@ -80,7 +105,7 @@ function extraPathDirs() {
   const dirs = [];
   if (process.env.APPDATA) dirs.push(path.join(process.env.APPDATA, 'npm'));
   if (process.env.LOCALAPPDATA) dirs.push(path.join(process.env.LOCALAPPDATA, 'cursor-agent'));
-  dirs.push(path.join(HOME, '.local', 'bin'));
+  dirs.push(path.join(HOME, '.local', 'bin'), path.join(HOME, '.opencode', 'bin'));
   return dirs;
 }
 
@@ -119,7 +144,11 @@ function buildEnv(extra) {
   for (const name of Object.keys(env)) {
     if (SESSION_MARKERS.some((m) => (m.endsWith('*') ? name.startsWith(m.slice(0, -1)) : name === m))) delete env[name];
   }
-  return { ...env, ...extra };
+  for (const [k, v] of Object.entries(extra)) {
+    if (v === null) delete env[k];
+    else env[k] = v;
+  }
+  return env;
 }
 
 function which(name, env) {
@@ -175,18 +204,29 @@ function unwrapShim(cmdPath) {
   return null;
 }
 
+// The agent's arguments for a launch; `file` is the resolved command (the shell's flags depend on it).
+// `inlineSettings`: the agent's path to the Claude settings file that keeps it inline.
+function agentArgs(agentId, { mode, nativeId, extraArgs, prompt, file, inlineSettings }) {
+  const agent = AGENTS[agentId];
+  if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+  return [
+    ...(agent.inline ? agent.inline(inlineSettings) : []),
+    ...agent.args(mode, nativeId, file),
+    ...splitArgs(extraArgs),
+    ...(prompt && agent.prompt ? agent.prompt(prompt) : []),
+  ];
+}
+
 // Returns { file, args } where args is a single pre-quoted string, which is how
 // node-pty passes a command line through unchanged on Windows.
 // `command` overrides the agent's default command (a name on PATH or a full path).
-function resolveLaunch(agentId, mode, nativeId, extraArgs, env, command) {
-  const agent = AGENTS[agentId];
-  if (!agent) throw new Error(`Unknown agent: ${agentId}`);
-  const cmd = (command || '').trim() || agent.command;
+function resolveLaunch(agentId, launch, env, command) {
+  const cmd = (command || '').trim() || AGENTS[agentId].command;
   const resolved = which(cmd, env);
   if (!resolved) {
     throw new Error(`'${cmd}' was not found${path.isAbsolute(cmd) ? '' : ' on PATH'}. Install it, or set its path in Setup (Settings → Workspaces & agents).`);
   }
-  const args = [...agent.args(mode, nativeId, resolved), ...splitArgs(extraArgs)];
+  const args = agentArgs(agentId, { ...launch, file: resolved });
   const ext = path.extname(resolved).toLowerCase();
 
   if (ext === '.cmd' || ext === '.bat') {
@@ -222,13 +262,15 @@ function locate(agentId, command, env) {
 }
 
 // Environment for an agent running under one of its accounts: a separate config
-// folder (Claude, Codex) or an API key (Cursor). Nothing for the normal login.
-function agentEnv(agentId, configDir, apiKey) {
+// folder (Claude, Codex) or an API key (Cursor). With `unsetDefault` the normal login
+// unsets the folder variable (null), as Claude's first account only finds ~/.claude.json
+// without it; otherwise it inherits whatever the app was started with.
+function agentEnv(agentId, configDir, apiKey, unsetDefault) {
   const agent = AGENTS[agentId];
   const env = {};
-  if (agent && agent.configEnv && configDir) env[agent.configEnv] = configDir;
+  if (agent && agent.configEnv && (configDir || unsetDefault)) env[agent.configEnv] = configDir || null;
   if (agent && agent.keyEnv && apiKey) env[agent.keyEnv] = apiKey;
   return env;
 }
 
-module.exports = { AGENTS, buildEnv, resolveLaunch, locate, agentEnv, splitArgs };
+module.exports = { AGENTS, buildEnv, resolveLaunch, agentArgs, locate, agentEnv, splitArgs };

@@ -1,6 +1,6 @@
 # NI Agent Terminal
 
-A Windows multi-tab terminal for **Claude Code**, **Codex** and **Cursor Agent** (plus a shell tab) that works in any folders you choose. Every conversation is recorded in a per-folder, per-agent history and can be resumed exactly through the agent's own session store.
+A Windows multi-tab terminal for **Claude Code**, **Codex**, **Cursor Agent** and **OpenCode** (plus a shell tab), run natively or inside WSL, that works in any folders you choose. Every conversation is recorded in a per-folder, per-agent history and can be resumed exactly through the agent's own session store.
 
 ## Run
 
@@ -11,12 +11,12 @@ A Windows multi-tab terminal for **Claude Code**, **Codex** and **Cursor Agent**
 
 On first start a Setup screen asks for:
 
-- **Workspace folders**: any number of folders (a monorepo, a folder of checkouts, a single project…). New tabs open in the first one. Every Git repository inside them, up to two levels down (`<folder>/<repo>` or `<folder>/repos/<repo>`), is listed with its current branch in the new-tab folder picker and in History's *Folder* view.
+- **Workspace folders**: any number of folders (a monorepo, a folder of checkouts, a single project…). New tabs open in the first one. Every Git repository inside them, up to two levels down (`<folder>/<repo>` or `<folder>/repos/<repo>`), is listed with its current branch in the new-tab folder picker and in History's *Folder* view, and so is a folder in between that holds repositories (`<folder>/repos`).
 - **Agents**, each of them:
   - **On / off**: switched-off agents are hidden from menus and shortcuts.
   - **Command**: a name on `PATH` (default `claude`, `codex`, `cursor-agent`, `powershell.exe`) or a full path to an `.exe` / `.cmd`. Setup shows where each resolves. `%APPDATA%
 pm`, `%LOCALAPPDATA%cursor-agent` and `~/.local/bin` are searched as well.
-  - **Accounts**: one or more logins per agent, e.g. *Personal* and *Work*. The selected one is used by new tabs. See [Accounts](#accounts).
+  - **Accounts**: one or more logins per agent, e.g. *Personal* and *Work*. A new chat asks which one to use. See [Accounts](#accounts).
 
 Change all of this later in **Settings → Workspaces & agents**, or click *workspace* in the status bar. If you upgrade from 1.1, the old `ni-agentic-development` folder is carried over as the first workspace folder, and Setup is shown once.
 
@@ -58,18 +58,48 @@ Each of Claude, Codex and Cursor can have several accounts (Setup → *Accounts*
 - **Claude, Codex**: each account is a config folder, passed as `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, with its own login and conversation store. An empty folder is your normal login. *Add account* proposes `~/.claude-2` / `~/.codex-2`; sign in once in a tab of that account.
 - **Cursor**: Cursor Agent has a single config folder, so each account is an API key (`CURSOR_API_KEY`, from the Cursor dashboard → Integrations). An account with no key is your normal login. Keys are encrypted for your Windows user (DPAPI) and never shown again.
 
-Once an agent has more than one account, its tabs show the account name, and the new-tab menu has an account picker.
+Once an agent has more than one account, its tabs show the account name, and a new chat asks which account to use. Resuming a conversation never asks: it runs under the account it last ran with.
 
-**Switching a tab's account** (Ctrl+Shift+A cycles; or click the account in the status bar; or the tab's right-click menu): the agent is stopped, the conversation is copied into the other account's store, and it resumes there. Use it to carry on in the same conversation after one account hits its usage limit. The account you switch to also becomes the one new tabs use.
+**Switching a tab's account** (Ctrl+Shift+A cycles; or click the account in the status bar; or the tab's right-click menu): the agent is stopped, the conversation is copied into the other account's store (nothing to copy when the accounts are linked, see [Agents view and WSL](#agents-view-and-wsl)), and it resumes there. Use it to carry on in the same conversation after one account hits its usage limit.
 
-Each history record remembers its account, so resuming it and following its `/clear` / `/new` keep using the right store. A 1.2 *Account folder* is carried over as a second account, still selected.
+Each history record remembers its account, so resuming it and following its `/clear` / `/new` keep using the right store. A 1.2 *Account folder* is carried over as a second account.
+
+## Agents view and WSL
+
+**Where agents run** (Setup): Windows, or a WSL distro. In WSL each tab runs the CLI installed inside the distro in its login shell, in the tab's folder as WSL sees it (`C:\G\code` is `/mnt/c/G/code`), and the agents' stores are read over `\\wsl$`. Account folders are WSL paths (`~/.claude-2`). Each history record keeps where it ran, so it always resumes there.
+
+Claude and Codex tabs keep their output in the terminal's own buffer (Claude's classic TUI through `--settings`, Codex's `-c tui.fullscreen_transcript=false`), for that launch only: scrollback, find, mouse selection and transcripts work whatever their full-screen settings are.
+
+With **Python 3** (with SQLite) in the backend:
+- *History → All* lists every conversation once: this app's own, and every Claude, Codex and OpenCode conversation in the agents' own stores from the last 40 days (Settings), wherever it was started. Conversations joined by a handoff are one entry, under the agent used last. Click previews the last turns; double-click resumes it in that agent, under the account it last ran with. Right-click: open under another Claude account, *Continue in* another agent (a handoff file with only the messages and tool notes it has not seen, kept in `handoffs\`), the saved transcript, hide or show again (*Hidden*). Ctrl+click marks entries; *Combine into…* hands them all to one agent. Without Python, All lists this app's own conversations only.
+- *Live* (title bar): a board of running sessions, in or outside the app, with their state, model, last action, subagents and (WSL) shells. A Claude tab's dot pulses while Claude is working.
+- *Link accounts* (Setup → Claude): every `~/.claude-<n>` login shares `~/.claude`'s history, keeping its own login, and conversations are labelled with their login. *New linked account* creates the next one. On Windows this needs Git for Windows and Developer Mode (symlinks).
+- Each agent's history is snapshotted once a day into `backups\<tool>` (the newest ten kept).
+
+## AgentSessionHub (console)
+
+`hub\AgentSessionHub.cmd` (`npm run hub`) opens the same conversations in Windows Terminal, for when a console is preferred or the app is not available: a fuzzy-search list (fzf) of every Claude, Codex and OpenCode conversation with transcript previews, and a live board of running sessions. Its agent tabs are ordinary Windows Terminal tabs.
+
+It has no settings or state of its own. It reads this app's `settings.json` (where agents run, which are on, the Claude accounts, the first workspace folder for new sessions) and runs the same engine (`src\py`) on the same data folder, so the handoff ledger, hidden list, backups and each conversation's account are the same in both. Run this app's Setup once first.
+
+| Action | Key |
+| --- | --- |
+| Search | Type to filter |
+| Resume the highlighted conversation, in its latest agent and account | Enter |
+| Open with another agent (handoff) or under another Claude account | Alt+T |
+| Mark conversations to combine into one | Tab, then Enter or Alt+T |
+| Transcript preview | Alt+P |
+| Hide / show hidden | Alt+H / Alt+S |
+| Reload | Esc |
+
+Mouse: a click highlights a row, a second click on it opens it. The first row starts a new session: agent, account (when Claude has several), then folder. It needs Windows Terminal, fzf (the Linux build inside WSL; `fzf.exe` and PowerShell 7 on Windows) and Python 3.8+. `hub\fixclip.cmd` re-owns the clipboard text when RDP stops forwarding what Windows Terminal copied.
 
 ## Keys
 
 | Key | Action |
 |---|---|
 | Ctrl+Shift+T | New tab menu (folder, agent, Last / Pick…) |
-| Ctrl+Shift+1 / 2 / 3 / 4 | New Claude / Codex / Cursor / Shell in the current tab's folder |
+| Ctrl+Shift+1 / 2 / 3 / 4 / 5 | New Claude / Codex / Cursor / Shell / OpenCode in the current tab's folder |
 | Ctrl+Tab, Ctrl+PgUp/PgDn | Switch tabs (tabs can also be dragged) |
 | Ctrl+Shift+W, middle-click | Close tab |
 | Ctrl+Shift+H | History panel (*This tab* prompts / *All sessions*) |
@@ -77,22 +107,29 @@ Each history record remembers its account, so resuming it and following its `/cl
 | Ctrl+Shift+F | Find in terminal |
 | Ctrl+Shift+Home / End | Scroll to the beginning / end of the terminal buffer |
 | Shift+PgUp / PgDn | Scroll up / down one page |
-| Ctrl+C with selection, Ctrl+Shift+C | Copy |
-| Ctrl+V, right-click | Paste (an image-only clipboard is passed to the agent) |
-| Shift+Enter | Newline in the agent prompt |
+| Ctrl+C with selection, Ctrl+Shift+C | Copy (or on selection, Settings); an agent's own copy (OSC 52, e.g. Claude's `/copy`) also reaches the clipboard |
+| Ctrl+V, right-click | Paste (an image-only clipboard is passed to the agent; in WSL, agents other than Claude get a saved PNG's path) |
+| Shift+Enter, Ctrl+Enter | Newline in the agent prompt |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Font size |
 | Enter on an exited tab | Resume it |
 
 Dropping files on a terminal inserts their quoted paths.
+
+Web links are drawn in the theme's blue in every tab, whatever printed them; clicking one opens it in the browser.
 
 ## Develop
 
 ```powershell
 npm install
 npm start               # run from source
+npm run shortcut        # Start menu shortcut to run this checkout (pin it to Start or the taskbar)
 npm run check           # syntax check
+npm test                # src/py tests (Python 3)
+npm run test:hub        # hub checks on throwaway data (Git for Windows, Python)
 npm run dist            # portable + installer exe into dist\
 ```
+
+After changing window code (`renderer.js`, `index.html`, `styles.css`), click the app icon in the top-left corner: the window reloads on it while tabs stay open and their agents keep running. Code of the main process loads when the app is restarted.
 
 Smoke testing: `NI_TERM_USERDATA` uses an isolated data folder. `NI_TERM_SMOKE=<png>` takes a screenshot and quits after `NI_TERM_SMOKE_DELAY` ms. `NI_TERM_SMOKE_JS` runs a script in the window halfway through.
 
