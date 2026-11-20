@@ -546,8 +546,6 @@ function renderTabs() {
     wrap.append(node);
   }
   $('#empty').classList.toggle('hidden', state.tabs.length > 0);
-  const active = wrap.querySelector('.tab.active');
-  if (active) active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
 
 function tabMenu(tab, x, y) {
@@ -1188,16 +1186,17 @@ async function renderTabPrompts(token) {
         convs.length > 1 ? plural(convs.length, 'conversation') : null,
         plural(all.length, 'prompt'),
       ].filter(Boolean).join(' · '))),
-    all.length
-      ? el('button', {
+    // replaceChildren would print a null as the text "null".
+    ...(all.length
+      ? [el('button', {
           class: 'small-btn',
           title: 'Copy every prompt sent from this tab',
           onclick: () => {
             ipc.clipboardWrite(all.map((p) => p.text).join(tab.agent === 'shell' ? '\n' : '\n\n'));
             toast(`Copied ${all.length} prompts`);
           },
-        }, 'Copy all')
-      : null
+        }, 'Copy all')]
+      : [])
   );
 
   const q = state.historyQuery.trim().toLowerCase();

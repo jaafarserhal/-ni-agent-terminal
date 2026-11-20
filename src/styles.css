@@ -29,7 +29,7 @@ body {
   background: var(--bg);
   color: var(--text);
   display: grid;
-  grid-template-rows: 40px 1fr 24px;
+  grid-template-rows: auto 1fr 24px;
   overflow: hidden;
   user-select: none;
 }
@@ -42,21 +42,23 @@ kbd {
 .mono { font-family: 'Cascadia Mono', Consolas, monospace; }
 
 /* ---------- title bar ---------- */
+/* Tabs wrap onto more rows instead of pushing the buttons off; the buttons, and Windows'
+   own controls (titleBarOverlay, 40 px), stay on the first row. */
 #titlebar {
-  display: flex; align-items: stretch; gap: 2px;
+  display: flex; align-items: flex-start; gap: 2px; min-height: 40px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
   -webkit-app-region: drag;
   padding-left: 8px;
 }
 #titlebar button, #tabs, .tab { -webkit-app-region: no-drag; }
-.brand { display: flex; align-items: center; padding-right: 6px; cursor: pointer; -webkit-app-region: no-drag; }
+.brand { display: flex; align-items: center; height: 40px; padding-right: 6px; cursor: pointer; -webkit-app-region: no-drag; }
 .brand img { width: 20px; height: 20px; }
-.drag-spacer { flex: 1; min-width: 40px; }
+.drag-spacer { flex: 1; min-width: 40px; align-self: stretch; }
+#titlebar > .icon-btn { align-self: flex-start; margin-top: 6px; flex: none; }
 .overlay-gap { width: var(--overlay-w); flex: none; }
 
-#tabs { display: flex; align-items: flex-end; gap: 2px; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; min-width: 0; padding-top: 6px; }
-#tabs::-webkit-scrollbar { display: none; }
+#tabs { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 4px 2px; min-width: 0; padding-top: 6px; }
 .tab {
   --c: var(--shell);
   display: flex; align-items: center; gap: 8px;
@@ -98,7 +100,7 @@ kbd {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 8px;
 }
 .icon-btn:hover, .icon-btn.on { background: var(--raised); color: var(--text); }
-.new-tab-wrap { display: flex; align-items: center; padding: 0 2px; }
+.new-tab-wrap { display: flex; align-items: center; height: 40px; padding: 0 2px; }
 
 /* ---------- popovers ---------- */
 .popover {
