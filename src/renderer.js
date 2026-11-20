@@ -1416,9 +1416,43 @@ $('#history-filter').addEventListener('click', (e) => {
   state.historyAgent = b.dataset.agent;
   renderHistory();
 });
-$('#history-search').addEventListener('input', (e) => {
-  state.historyQuery = e.target.value;
+function setHistoryQuery(q) {
+  state.historyQuery = $('#history-search').value = q;
+  $('#history-search-clear').classList.toggle('hidden', !q);
   renderHistory();
+}
+$('#history-search').addEventListener('input', (e) => setHistoryQuery(e.target.value));
+$('#history-search').addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || !state.historyQuery) return;
+  e.stopPropagation();
+  setHistoryQuery('');
+});
+$('#history-search-clear').onclick = () => {
+  setHistoryQuery('');
+  $('#history-search').focus();
+};
+
+// The panel's width: dragged at its left edge, remembered with the open tabs (state.json).
+// null is the stylesheet's width.
+function setHistoryWidth(px) {
+  state.historyWidth = px ? Math.round(Math.max(260, Math.min(px, window.innerWidth * 0.7))) : null;
+  $('#history').style.width = state.historyWidth ? `${state.historyWidth}px` : '';
+  fitActive();
+}
+$('#history-resize').addEventListener('mousedown', (e) => {
+  e.preventDefault();
+  const drag = (m) => setHistoryWidth(window.innerWidth - m.clientX);
+  document.body.classList.add('resizing');
+  document.addEventListener('mousemove', drag);
+  document.addEventListener('mouseup', () => {
+    document.removeEventListener('mousemove', drag);
+    document.body.classList.remove('resizing');
+    saveState();
+  }, { once: true });
+});
+$('#history-resize').addEventListener('dblclick', () => {
+  setHistoryWidth(null);
+  saveState();
 });
 
 // ---------------------------------------------------------------------------
@@ -2298,7 +2332,7 @@ function saveStateNow() {
     t.record ? { tabId: t.id, recordId: t.record.id, agent: t.agent, chain: t.chain } : { agent: t.agent, cwd: t.cwd, mode: t.mode, accountId: t.accountId }
   );
   const activeIndex = Math.max(0, state.tabs.findIndex((t) => t.id === state.activeId));
-  return ipc.saveState({ tabs, activeIndex }).catch(() => {});
+  return ipc.saveState({ tabs, activeIndex, historyWidth: state.historyWidth }).catch(() => {});
 }
 
 ipc.onData(({ tabId, data }) => {
@@ -2396,6 +2430,7 @@ async function boot() {
   state.settings = init.settings;
   state.workspace = init.workspace;
   state.userData = init.userData;
+  setHistoryWidth(init.historyWidth);
   for (const a of init.agents) state.agents[a.id] = a;
   renderEmptyActions();
 

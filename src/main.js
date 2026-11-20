@@ -739,6 +739,7 @@ handle('app:init', async () => {
     agents: await agentStatus(),
     restore,
     activeIndex: state.activeIndex || 0,
+    historyWidth: state.historyWidth || null,
     userData,
   };
 });

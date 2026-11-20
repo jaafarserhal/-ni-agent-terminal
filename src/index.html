@@ -97,6 +97,7 @@
     </section>
 
     <aside id="history" class="hidden" aria-label="History">
+      <div id="history-resize" title="Drag to resize · double-click to reset"></div>
       <div class="side-head">
         <h3>History</h3>
         <button id="history-folder" class="small-btn" title="Open the history files on disk">Files</button>
@@ -124,7 +125,10 @@
         <button data-agent="opencode">OpenCode</button>
         <button data-agent="shell">Shell</button>
       </div>
-      <input id="history-search" class="search" placeholder="Search title, folder or id" spellcheck="false" />
+      <div class="search">
+        <input id="history-search" placeholder="Search title, folder or id" spellcheck="false" />
+        <button id="history-search-clear" class="hidden" title="Clear the search (Esc)" aria-label="Clear the search">✕</button>
+      </div>
       <div id="history-tabhead" class="tabhead"></div>
       <div id="history-list"></div>
     </aside>
