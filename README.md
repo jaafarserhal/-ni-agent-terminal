@@ -72,7 +72,7 @@ Claude and Codex tabs keep their output in the terminal's own buffer (Claude's c
 
 With **Python 3** (with SQLite) in the backend:
 - *History → Agents*: every Claude, Codex and OpenCode conversation in the agents' own stores from the last 40 days (Settings): conversations joined by a handoff are one row, under the agent used last. Click previews the last turns, double-click resumes it in a tab. Right-click: open under another Claude account, *Continue in* another agent (a handoff file with only the messages and tool notes it has not seen, kept in `handoffs\`), hide or show again (*Hidden*). Ctrl+click marks rows; *Combine into…* hands them all to one agent.
-- *History → Live*: running sessions with their state, model, last action, subagents and (WSL) shells. A Claude tab's dot pulses while Claude is working.
+- *Live* (title bar): a board of running sessions, in or outside the app, with their state, model, last action, subagents and (WSL) shells. A Claude tab's dot pulses while Claude is working.
 - *Link accounts* (Setup → Claude): every `~/.claude-<n>` login shares `~/.claude`'s history, keeping its own login, and conversations are labelled with their login. *New linked account* creates the next one. On Windows this needs Git for Windows and Developer Mode (symlinks).
 - Each agent's history is snapshotted once a day into `backups\<tool>` (the newest ten kept).
 

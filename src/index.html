@@ -19,6 +19,10 @@
       </button>
     </div>
     <div class="drag-spacer"></div>
+    <button id="btn-live" class="icon-btn text-btn" title="Running sessions with their state, model, last action, subagents and shells">
+      <svg viewBox="0 0 16 16" width="14" height="14"><path d="M1.5 8h3l2-5 3 10 2-5h3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Live</span>
+    </button>
     <button id="btn-history" class="icon-btn text-btn" title="History (Ctrl+Shift+H)">
       <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 4v4l2.5 1.5M2.5 8a5.5 5.5 0 1 0 1.6-3.9M2 2.5v2.6h2.6" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <span>History</span>
@@ -54,6 +58,20 @@
         <button id="find-next" class="small-btn" title="Next (Enter)">↓</button>
         <button id="find-close" class="small-btn" title="Close (Esc)">✕</button>
       </div>
+      <div id="live" class="viewer live hidden">
+        <div class="viewer-head">
+          <div class="viewer-title">
+            <div>
+              <div class="name">Live</div>
+              <div class="meta">Running Claude, Codex and OpenCode sessions, in or outside this app, with their subagents and shells</div>
+            </div>
+          </div>
+          <div class="viewer-actions">
+            <button id="live-close" class="small-btn" title="Close (Esc)">✕</button>
+          </div>
+        </div>
+        <div id="live-list"></div>
+      </div>
       <div id="viewer" class="viewer hidden">
         <div class="viewer-head">
           <div class="viewer-title">
@@ -88,7 +106,6 @@
         <button data-scope="folder" title="Sessions started in one folder">Folder</button>
         <button data-scope="all" title="Every session, all folders">All</button>
         <button data-scope="agents" title="Every Claude, Codex and OpenCode conversation in the agents' own stores, across folders and agents">Agents</button>
-        <button data-scope="live" title="Running sessions with their state, model, last action and subagents">Live</button>
       </div>
       <div id="history-folder-row" class="folder-row hidden">
         <select id="history-folder-select" title="Folder"></select>

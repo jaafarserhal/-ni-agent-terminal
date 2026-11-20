@@ -428,6 +428,7 @@ function activateTab(id) {
   const tab = state.tabs.find((t) => t.id === id);
   if (!tab) return;
   closeViewer();
+  if (liveOpen()) toggleLive(false);
   state.activeId = id;
   tab.node && tab.node.classList.remove('activity');
   tab.activity = false;
@@ -855,6 +856,7 @@ document.addEventListener('keydown', (e) => {
     if (!$('#modal').classList.contains('hidden')) return closeModal();
     if (!$('#new-menu').classList.contains('hidden') || !$('#ctx').classList.contains('hidden')) return closePopovers();
     if (state.viewer) return closeViewer();
+    if (liveOpen()) return toggleLive(false);
     if (!$('#find').classList.contains('hidden')) return closeFind();
   }
   if (!isAppShortcut(e)) return;
@@ -1069,18 +1071,17 @@ async function renderHistory() {
   $('#history-tabhead').classList.toggle('hidden', scope !== 'tab');
   $('#history-folder-row').classList.toggle('hidden', scope !== 'folder');
   $('#history-agents-row').classList.toggle('hidden', scope !== 'agents');
-  $('#history-search').classList.toggle('hidden', scope === 'live');
   $('#history-search').placeholder =
     scope === 'tab' ? 'Search prompts in this tab' : scope === 'folder' ? 'Search sessions in this folder' : 'Search title, folder or id';
   if (scope === 'tab') return renderTabPrompts(token);
-  // The stores' views only know the engine's agents.
-  const storeScope = scope === 'agents' || scope === 'live';
+  // Only agents that are switched on, and in the Agents view only those the engine reads.
+  const offered = (agent) => agent === 'all' || (enabledAgents().includes(agent) && (scope !== 'agents' || ENGINE_AGENTS.includes(agent)));
+  if (!offered(state.historyAgent)) state.historyAgent = 'all';
   for (const b of document.querySelectorAll('#history-filter button')) {
     b.classList.toggle('on', b.dataset.agent === state.historyAgent);
-    b.classList.toggle('hidden', storeScope && b.dataset.agent !== 'all' && !ENGINE_AGENTS.includes(b.dataset.agent));
+    b.classList.toggle('hidden', !offered(b.dataset.agent));
   }
   if (scope === 'agents') return renderAgents(token);
-  if (scope === 'live') return renderLive(token);
 
   const cwd = scope === 'folder' ? historyFolderCwd() : null;
   if (scope === 'folder') renderFolderRow(token, cwd);
@@ -1701,7 +1702,7 @@ $('#history-agents-reload').onclick = async () => {
 };
 
 // ---------------------------------------------------------------------------
-// Live view: running sessions
+// Live board: running sessions (its own title-bar button)
 // ---------------------------------------------------------------------------
 
 function shortAge(since) {
@@ -1709,35 +1710,41 @@ function shortAge(since) {
   return s >= 86400 ? `${Math.floor(s / 86400)}d` : s >= 3600 ? `${Math.floor(s / 3600)}h` : s >= 60 ? `${Math.floor(s / 60)}m` : `${s}s`;
 }
 
-let liveRows = null;
+const liveOpen = () => !$('#live').classList.contains('hidden');
+
+function toggleLive(show = !liveOpen()) {
+  $('#live').classList.toggle('hidden', !show);
+  $('#btn-live').classList.toggle('on', show);
+  if (show) renderLive();
+  else if (activeTab()) activeTab().term.focus();
+}
+
 let liveBusy = false;
-async function renderLive(token) {
-  const list = $('#history-list');
-  if (!liveRows) list.replaceChildren(el('div', { class: 'h-empty' }, 'Reading running sessions…'));
+async function renderLive() {
   // Each read runs Python in the backend; a slow one is not stacked on.
   if (liveBusy) return;
   liveBusy = true;
   const res = await ipc.storesBoard().then((rows) => ({ rows }), (err) => ({ error: err.message })).finally(() => { liveBusy = false; });
-  if (token !== historyRender) return;
-  liveRows = res.rows || [];
-  list.replaceChildren();
-  if (res.error) return list.append(el('div', { class: 'h-empty' }, res.error));
-  const rows = liveRows.filter((r) => state.historyAgent === 'all' || r.label === state.historyAgent).sort((a, b) => b.since - a.since);
-  if (!rows.length) return list.append(el('div', { class: 'h-empty' }, 'No active sessions.'));
-  const item = (r, parent) =>
-    el('div', { class: `lv-item${parent ? ' child' : ''}`, style: `--c:${agentColor(parent ? parent.label : r.label)};--d:${r.depth || 0}` },
+  const cells = (cls, agent, project, r) =>
+    el('div', { class: `lv-row ${cls}`, style: `--c:${agentColor(agent)};--d:${r.depth || 0}` },
       el('span', { class: `lv-state ${r.state}` }, r.state),
-      el('span', { class: 't' }, parent ? `${r.label}: ${r.title}` : r.title || r.project),
-      el('span', { class: 'm' }, [parent ? null : agentLabel(r.label), parent ? null : r.project, r.model, shortAge(r.since)].filter(Boolean).join(' · ')),
-      r.detail ? el('span', { class: 'lv-detail' }, r.detail) : null);
-  for (const r of rows) {
-    list.append(item(r));
-    for (const c of r.children.slice().sort((a, b) => b.since - a.since)) list.append(item(c, r));
-  }
+      el('span', { class: 'lv-agent' }, cls ? `└ ${r.label}` : agentLabel(r.label)),
+      el('span', { class: 'lv-dim' }, project),
+      el('span', { class: 'lv-dim' }, shortAge(r.since)),
+      el('span', { class: 'lv-dim' }, r.model),
+      el('span', { class: 'lv-what', title: [r.title, r.detail].filter(Boolean).join('\n') }, r.title, r.detail ? el('span', { class: 'lv-detail' }, r.detail) : null));
+  const byNewest = (a, b) => b.since - a.since;
+  $('#live-list').replaceChildren(
+    el('div', { class: 'lv-row head' }, ...['state', 'agent', 'project', 'for', 'model', 'title / last action'].map((h) => el('span', {}, h))),
+    ...(res.error
+      ? [el('div', { class: 'h-empty' }, res.error)]
+      : res.rows.length
+        ? res.rows.sort(byNewest).flatMap((r) => [cells('', r.label, r.project, r), ...r.children.sort(byNewest).map((c) => cells('child', r.label, '', c))])
+        : [el('div', { class: 'h-empty' }, 'No active sessions.')]));
 }
-setInterval(() => {
-  if (state.historyScope === 'live' && !$('#history').classList.contains('hidden')) renderHistory();
-}, 3000);
+setInterval(() => liveOpen() && renderLive(), 3000);
+$('#btn-live').onclick = () => toggleLive();
+$('#live-close').onclick = () => toggleLive(false);
 
 // ---------------------------------------------------------------------------
 // transcript viewer
